@@ -125,3 +125,10 @@ Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 ## License
 
 MIT.
+
+## Related
+
+Other single-file tools in this portfolio that pair with this one:
+
+- [fcload](https://github.com/uhsear/fcload) - the load itself, refusing the imports that corrupt silently
+- [hostedreap](https://github.com/uhsear/hostedreap) - the hosted feature layer equivalent
