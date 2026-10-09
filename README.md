@@ -20,11 +20,12 @@ safe_republish self-test: no arcpy, no database, no network
 PASS  an identical count swings 0%
 PASS  a 15 point drop from 100 swings 15%
 ...
-PASS  a 37% loss is REFUSED even though the count is large
 PASS  an EMPTY TARGET is REFUSED by default  <-- pinned defect
 ...
+PASS  a unique prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
+...
 --------------------------------------------------------------------
-49 assertions, 0 failed
+126 assertions, 0 failed
 ```
 
 ## Requirements

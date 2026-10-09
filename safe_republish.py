@@ -633,6 +633,13 @@ def self_test():
     # ---- argument handling
     a = _parse(["--source", "s", "--target", "t"])
     check(a.apply is False, "--apply defaults to OFF")
+    try:
+        _parse(["--source", "s", "--target", "t", "--ap"])
+        prefix_refused = False
+    except SystemExit:
+        prefix_refused = True
+    check(prefix_refused,
+          "a unique prefix --ap of --apply is REFUSED by the parser  <-- pinned defect")
     check(a.allow_empty_target is False, "--allow-empty-target defaults to OFF")
     check(a.max_swing == DEFAULT_MAX_SWING, "--max-swing defaults to the configured value")
     check(a.min_rows == DEFAULT_MIN_ROWS, "--min-rows defaults to the configured value")
@@ -855,6 +862,7 @@ def self_test():
 def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="safe_republish.py",
+        allow_abbrev=False,
         description="Refuse to truncate a feature class when the staged "
                     "replacement fails a plausibility check.",
         epilog="Config precedence: flag > environment > the CONFIGURATION "
