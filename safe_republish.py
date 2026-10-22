@@ -21,6 +21,13 @@ key format changes, JoinField runs clean, every row arrives and every attribute
 is NULL. --null-fields gates that, because the count is perfect and the data is
 worthless.
 
+--cover reads both field lists before the truncate. Append null-fills every
+target field the staged data does not feed, drops every staged field the target
+does not have, and under TEST rejects the mismatch only after the truncate has
+already emptied the target. --transactional runs the clear and the append in one
+edit session, so a failure rolls the target back. It is off by default, and it
+has not been run against an enterprise geodatabase (see the README).
+
 --scan finds the pattern in a tree of scripts, so you can learn which of them
 need this before you have to wrap any of them. --plan decides a whole batch of
 pairs before performing any of them.
@@ -29,10 +36,14 @@ pairs before performing any of them.
     python safe_republish.py --source staged.gdb/Parcels --target prod.sde/Parcels
     python safe_republish.py --source staged.gdb/Parcels --target prod.sde/Parcels --apply
     python safe_republish.py --source s.gdb/Parcels --target p.sde/Parcels --null-fields PARCELID
+    python safe_republish.py --source s.gdb/Parcels --target p.sde/Parcels --cover
+    python safe_republish.py --source s.gdb/Parcels --target p.sde/Parcels --transactional --apply
     python safe_republish.py --scan C:/etl/scripts
     python safe_republish.py --plan nightly.txt --apply
 
-Exit codes: 0 allowed, 1 refused, 2 the replace failed part way, 64 usage error.
+Exit codes: 0 allowed, 1 refused, 2 the replace failed (with --transactional the
+target was rolled back, and the message says whether that was confirmed),
+64 usage error.
 """
 
 from __future__ import print_function
@@ -43,6 +54,7 @@ import io
 import os
 import re
 import sys
+import tempfile
 import tokenize
 
 # =============================================================================
@@ -83,6 +95,32 @@ PRO_PYTHON = r"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.
 # Decision codes.
 ALLOW = "ALLOW"
 REFUSE = "REFUSE"
+
+# Field roles for --cover. "system" fields (object id, geometry, shape length and
+# area) are skipped. "regenerated" fields (global id, editor tracking) are filled
+# by the geodatabase on every append, so a staged value never lands in them.
+ROLE_DATA = "data"
+ROLE_SYSTEM = "system"
+ROLE_REGENERATED = "regenerated"
+
+# Lossless widenings only. A staged field of the key type may feed a target field
+# of any listed type. BigInteger to Double is absent because a double cannot hold
+# every 64 bit integer. Only SmallInteger to Integer was run on Pro (README).
+WIDENING = {
+    "SmallInteger": ("Integer", "BigInteger", "Single", "Double"),
+    "Integer": ("BigInteger", "Double"),
+    "Single": ("Double",),
+}
+
+COVER_OK = "OK"
+COVER_NULLED = "NULLED"
+COVER_TYPE = "TYPE"
+COVER_LENGTH = "LENGTH"
+COVER_REGENERATED = "REGENERATED"
+COVER_DROPPED = "DROPPED"
+
+Fld = collections.namedtuple("Fld", "name type length role")
+Cover = collections.namedtuple("Cover", "status field detail refuses")
 
 
 class Decision(object):
@@ -134,7 +172,7 @@ def swing_fraction(staged, live):
 
 def decide(staged, live, min_rows=DEFAULT_MIN_ROWS, max_swing=DEFAULT_MAX_SWING,
            allow_empty_target=False, null_counts=None,
-           max_null_pct=DEFAULT_MAX_NULL_PCT):
+           max_null_pct=DEFAULT_MAX_NULL_PCT, cover=None):
     """Decide whether the staged data may replace the live data.
 
     An empty target REFUSES unless allow_empty_target is passed. This is the
@@ -151,6 +189,10 @@ def decide(staged, live, min_rows=DEFAULT_MIN_ROWS, max_swing=DEFAULT_MAX_SWING,
     renaming a field disabled the guard that watched it and said nothing. Counts
     arrive here as integers, exactly as row counts do, which keeps the whole
     decision free of arcpy.
+
+    cover is the list cover_fields() returns, or None when --cover was not
+    asked for. Every entry that refuses refuses the run, and every other entry
+    that is not a plain match is reported.
     """
     if staged is None or live is None:
         raise ValueError("counts must be integers, got staged=%r live=%r"
@@ -225,7 +267,110 @@ def decide(staged, live, min_rows=DEFAULT_MIN_ROWS, max_swing=DEFAULT_MAX_SWING,
                 "field %s is %.1f%% NULL or blank (limit %.1f%%)"
                 % (field, fraction * 100.0, max_null_pct * 100.0))
 
+    if cover is not None:
+        matched = [c for c in cover if c.status == COVER_OK]
+        reasons.append("field coverage: %d target field(s) are filled from the "
+                       "staged data" % len(matched))
+        for entry in cover:
+            if entry.status == COVER_OK:
+                continue
+            if entry.refuses:
+                verdict = REFUSE
+            reasons.append("field %s %s: %s"
+                           % (entry.field, entry.status, entry.detail))
+
     return Decision(verdict, reasons, staged, live, swing)
+
+
+# --------------------------------------------------------------- field coverage
+
+def _type_fits(staged_type, target_type):
+    return staged_type == target_type or target_type in WIDENING.get(staged_type, ())
+
+
+def cover_fields(target, staged, mapping=None, allow=(), strict=False):
+    """Say, before the truncate, what the append will do to every target field.
+
+    target and staged are lists of Fld. mapping is None to match fields by name,
+    or {TARGET NAME: [staged field names]} read from a field map. Names compare
+    without case, because Append does (README, experiment 1).
+
+    Append null-fills a target field that nothing feeds. It drops a staged field
+    the target lacks, converts text into a number without a word when it cannot
+    (the value becomes 0), and skips without an error any row whose text is
+    longer than the target field. All four were run on Pro. The truncate has
+    already happened by the time any of them shows.
+
+    strict is True when Append will run under TEST. TEST rejects a missing
+    field, an extra field, a type mismatch, and a tracking or global id field
+    the staged data lacks, so those refuse here and no allow list waives them:
+    the append would fail anyway, after the truncate. TEST does not reject a
+    short text field, so LENGTH stays waivable.
+
+    allow names target fields whose finding the operator accepts. It cannot
+    turn a refusal TEST would repeat into an allow.
+
+    Returns a list of Cover(status, field, detail, refuses).
+    """
+    waive = set(name.strip().upper() for name in allow)
+    by_name = dict((f.name.upper(), f) for f in staged)
+    used = set()
+    found = []
+
+    def add(status, name, detail, hard=False):
+        waived = name.upper() in waive and not hard
+        if waived:
+            detail += " (accepted by --cover-allow)"
+        found.append(Cover(status, name, detail, not waived))
+
+    for field in target:
+        if field.role == ROLE_SYSTEM:
+            continue
+        if mapping is None:
+            inputs = [field.name] if field.name.upper() in by_name else []
+        else:
+            inputs = mapping.get(field.name.upper(), [])
+        used.update(name.upper() for name in inputs)
+        feeder = by_name.get(inputs[0].upper()) if inputs else None
+
+        if feeder is None and field.role == ROLE_REGENERATED:
+            if strict:
+                add(COVER_REGENERATED, field.name,
+                    "is a tracking or global id field the staged data lacks, "
+                    "and TEST rejects that after the truncate", hard=True)
+            else:
+                found.append(Cover(
+                    COVER_REGENERATED, field.name,
+                    "is refilled by the geodatabase, so its current values are "
+                    "lost", False))
+        elif feeder is None:
+            add(COVER_NULLED, field.name,
+                "is fed by nothing in the staged data, so every row will be "
+                "NULL after the truncate" if not inputs else
+                "is mapped from %s, which the staged data does not have"
+                % inputs[0], hard=strict)
+        elif not _type_fits(feeder.type, field.type):
+            add(COVER_TYPE, field.name,
+                "is %s in the target and %s in the staged data. Append cannot "
+                "convert some values and writes 0 or NULL without an error"
+                % (field.type, feeder.type), hard=strict)
+        elif field.type == "String" and feeder.length > field.length:
+            add(COVER_LENGTH, field.name,
+                "holds text up to %d in the target and %d in the staged data. "
+                "Append skips any row with longer text, with no error"
+                % (field.length, feeder.length))
+        else:
+            found.append(Cover(COVER_OK, field.name, "", False))
+
+    for field in staged:
+        if field.role == ROLE_SYSTEM or field.name.upper() in used:
+            continue
+        found.append(Cover(
+            COVER_DROPPED, field.name,
+            "is in the staged data and not in the target, so Append drops it"
+            + (" (TEST rejects this after the truncate)" if strict else ""),
+            strict))
+    return found
 
 
 # Underscore is a word character, so "TruncateTable\b" never matches
@@ -407,6 +552,75 @@ def is_versioned(path, arcpy):
     return bool(getattr(described, "isVersioned", False))
 
 
+def describe_fields(path, arcpy):
+    """The Fld list for a table, with each field's role tagged for --cover.
+
+    The shape length and area fields and the tracking and global id fields are
+    named by Describe, not by ListFields, so a name is looked up there. A
+    Describe that lacks an attribute (a plain table has no shape length) just
+    contributes nothing.
+    """
+    described = arcpy.Describe(path)
+    roles = {}
+    for attr, role in (("lengthFieldName", ROLE_SYSTEM),
+                       ("areaFieldName", ROLE_SYSTEM),
+                       ("globalIDFieldName", ROLE_REGENERATED),
+                       ("creatorFieldName", ROLE_REGENERATED),
+                       ("createdAtFieldName", ROLE_REGENERATED),
+                       ("editorFieldName", ROLE_REGENERATED),
+                       ("editedAtFieldName", ROLE_REGENERATED)):
+        name = getattr(described, attr, "")
+        if name:
+            roles[name.upper()] = role
+    fields = []
+    for field in arcpy.ListFields(path):
+        if field.type in ("OID", "Geometry"):
+            role = ROLE_SYSTEM
+        else:
+            role = roles.get(field.name.upper(), ROLE_DATA)
+        fields.append(Fld(field.name, field.type, field.length, role))
+    return fields
+
+
+def _same_table(left, right):
+    return (os.path.normcase(os.path.normpath(left))
+            == os.path.normcase(os.path.normpath(right)))
+
+
+def read_mapping(text, source, arcpy):
+    """Read an arcpy field map string into {TARGET NAME: [staged field names]}.
+
+    arcpy parses the string, so the format is arcpy's and not guessed here. Only
+    inputs that come from the source table count. The usual recipe adds the
+    target table to the map first, and Append never reads from it, so a field
+    that only the target table feeds is fed by nothing. The source has to be
+    spelled as the map spells it, case and slashes aside; a mismatch feeds
+    nothing and refuses, which is the safe way to be wrong.
+
+    loadFromString does not complain about garbage on Pro 3.6. It reads the
+    whole text as one output field with no input, so every real target field is
+    then unfed and --cover refuses. A blank string raises ERROR 999999.
+    """
+    maps = arcpy.FieldMappings()
+    maps.loadFromString(text)
+    mapping = {}
+    for index in range(maps.fieldCount):
+        one = maps.getFieldMap(index)
+        mapping[one.outputField.name.upper()] = [
+            one.getInputFieldName(n) for n in range(one.inputFieldCount)
+            if _same_table(one.getInputTableName(n), source)]
+    return mapping
+
+
+def workspace_of(path, arcpy):
+    """The geodatabase that holds path. A feature class in a feature dataset is
+    one level deeper than a feature class at the top."""
+    parent = arcpy.Describe(path).path
+    if getattr(arcpy.Describe(parent), "dataType", "") == "FeatureDataset":
+        parent = arcpy.Describe(parent).path
+    return parent
+
+
 def clear_target(path, arcpy):
     """Empty the target, choosing the operation its versioning allows."""
     if is_versioned(path, arcpy):
@@ -416,20 +630,27 @@ def clear_target(path, arcpy):
     return "TruncateTable"
 
 
+def _schema_for(schema_type, field_mapping):
+    """Append ignores a field map under TEST, so a mapped call is sent NO_TEST.
+    That is local to the call and leaves the configured default alone."""
+    return "NO_TEST" if field_mapping else schema_type
+
+
 def replace(source, target, arcpy, schema_type=APPEND_SCHEMA_TYPE,
-            field_mapping=None):
+            field_mapping=None, transactional=False):
     """Clear the target and append the source. Returns the final row count.
 
     field_mapping is the opaque arcpy field-map string, passed through so the
-    tool can be dropped into the call sites that need one. Append ignores a
-    mapping under TEST, so a call that carries one is sent as NO_TEST. That is
-    local to this call and leaves the configured default alone.
+    tool can be dropped into the call sites that need one. transactional runs
+    the whole thing in one edit session instead (replace_in_session).
     """
+    if transactional:
+        return replace_in_session(source, target, arcpy, schema_type,
+                                  field_mapping)
     staged = count_rows(source, arcpy)
     how = clear_target(target, arcpy)
     print("  cleared target via %s" % how)
-    if field_mapping:
-        schema_type = "NO_TEST"
+    schema_type = _schema_for(schema_type, field_mapping)
     try:
         arcpy.management.Append(source, target, schema_type, field_mapping)
     except Exception as exc:
@@ -453,6 +674,64 @@ def replace(source, target, arcpy, schema_type=APPEND_SCHEMA_TYPE,
     return staged
 
 
+def replace_in_session(source, target, arcpy, schema_type=APPEND_SCHEMA_TYPE,
+                       field_mapping=None):
+    """Clear and refill the target inside one edit session.
+
+    DeleteRows replaces TruncateTable here, because Pro refuses a truncate while
+    editing (ERROR 160592). A failed Append, or a row count that is not the
+    staged count, aborts the operation and discards the session, so the target
+    keeps its rows. Run on a file and a mobile geodatabase only. An enterprise
+    geodatabase has not been run, and the README says so.
+    """
+    staged = count_rows(source, arcpy)
+    before = count_rows(target, arcpy)
+    versioned = is_versioned(target, arcpy)
+    editor = arcpy.da.Editor(workspace_of(target, arcpy))
+    try:
+        editor.startEditing(False, versioned)
+    except Exception as exc:
+        raise RuntimeError(
+            "could not open an edit session on %s, so nothing was emptied: %s"
+            % (target, exc))
+    try:
+        editor.startOperation()
+        arcpy.management.DeleteRows(target)
+        print("  emptied target via DeleteRows inside an edit session")
+        arcpy.management.Append(source, target,
+                                _schema_for(schema_type, field_mapping),
+                                field_mapping)
+        print("  appended %d row(s) from the staged source" % staged)
+        if VERIFY_AFTER_APPEND:
+            after = count_rows(target, arcpy)
+            if after != staged:
+                raise RuntimeError(
+                    "ROW COUNT MISMATCH after append: staged %d, target now %d"
+                    % (staged, after))
+            print("  verified: target now holds %d row(s)" % after)
+        editor.stopOperation()
+        editor.stopEditing(True)
+    except Exception as exc:
+        # shortcut: a failed abort is swallowed, because the recount below is
+        # the evidence and it is reported either way.
+        for undo in (editor.abortOperation, lambda: editor.stopEditing(False)):
+            try:
+                undo()
+            except Exception:
+                pass
+        restored = count_rows(target, arcpy)
+        if restored == before:
+            state = ("The edit session was rolled back and the target holds "
+                     "its original %d row(s)." % before)
+        else:
+            state = ("The rollback could NOT be confirmed: the target holds "
+                     "%d row(s) and held %d. Inspect it before re-running."
+                     % (restored, before))
+        raise RuntimeError("Replacing %s FAILED inside an edit session. %s "
+                           "Cause: %s" % (target, state, exc))
+    return staged
+
+
 # ------------------------------------------------------------------ self-test
 
 class _FakeCursor(object):
@@ -468,6 +747,81 @@ class _FakeCursor(object):
         return False
 
 
+class _FakeEditor(object):
+    """arcpy.da.Editor, with a rollback that really restores the row counts."""
+
+    def __init__(self, arcpy, workspace):
+        self.arcpy = arcpy
+        self.workspace = workspace
+        self.log = []
+        self.snapshot = None
+
+    def startEditing(self, with_undo, multiuser):
+        if self.arcpy.edit_error:
+            raise RuntimeError(self.arcpy.edit_error)
+        self.log.append(("startEditing", with_undo, multiuser))
+
+    def startOperation(self):
+        self.snapshot = dict(self.arcpy.counts)
+        self.log.append(("startOperation",))
+
+    def stopOperation(self):
+        self.log.append(("stopOperation",))
+        if self.arcpy.commit_error:
+            raise RuntimeError(self.arcpy.commit_error)
+
+    def abortOperation(self):
+        self.log.append(("abortOperation",))
+        if self.arcpy.abort_error:
+            raise RuntimeError(self.arcpy.abort_error)
+        if not self.arcpy.rollback_broken:
+            self.arcpy.counts = dict(self.snapshot)
+
+    def stopEditing(self, save):
+        self.log.append(("stopEditing", save))
+        if not save and not self.arcpy.rollback_broken:
+            self.arcpy.counts = dict(self.snapshot)
+
+
+class _FakeFieldMap(object):
+    def __init__(self, out_name, inputs):
+        self.outputField = type("_Out", (object,), {"name": out_name})()
+        self.inputs = inputs
+        self.inputFieldCount = len(inputs)
+
+    def getInputFieldName(self, index):
+        return self.inputs[index][1]
+
+    def getInputTableName(self, index):
+        return self.inputs[index][0]
+
+
+class _FakeFieldMappings(object):
+    """FieldMappings over a toy string: OUT=IN1|t:IN2;OUT2=  (an empty side is
+    no input, and a "t:" prefix names the table the input comes from, "s" when
+    absent). Like arcpy 3.6 it reads a part with no "=" as an output field of that
+    name with no input. The real parse is arcpy's, and the README shows it run
+    on Pro."""
+
+    def __init__(self):
+        self.maps = []
+        self.fieldCount = 0
+
+    def loadFromString(self, text):
+        for part in text.split(";"):
+            out, _eq, ins = part.partition("=")
+            inputs = []
+            for token in ins.split("|"):
+                if token:
+                    table, colon, name = token.rpartition(":")
+                    inputs.append((table if colon else "s", name))
+            self.maps.append(_FakeFieldMap(out, inputs))
+        self.fieldCount = len(self.maps)
+
+    def getFieldMap(self, index):
+        return self.maps[index]
+
+
 class _FakeArcpy(object):
     """The smallest arcpy the geodatabase layer can be driven against.
 
@@ -478,19 +832,37 @@ class _FakeArcpy(object):
 
     describe_error is the shape that matters: a Describe that raises used to be
     read as "not versioned" and the target was truncated anyway.
+
+    specs maps a path to its (name, type, length) fields for ListFields, and
+    attrs maps a path to extra Describe attributes. append_skips is how many
+    rows Append silently fails to write, which is what Pro does with text longer
+    than the target field.
     """
 
     def __init__(self, counts=None, versioned=False, describe_error=None,
-                 append_error=None, fields=(), rows=()):
+                 append_error=None, fields=(), rows=(), specs=None, attrs=None,
+                 append_skips=0, edit_error=None, commit_error=None,
+                 abort_error=None, rollback_broken=False):
         self.counts = dict(counts or {})
         self.versioned = versioned
         self.describe_error = describe_error
         self.append_error = append_error
         self.fields = list(fields)
         self.rows = list(rows)
+        self.specs = dict(specs or {})
+        self.attrs = dict(attrs or {})
+        self.append_skips = append_skips
+        self.edit_error = edit_error
+        self.commit_error = commit_error
+        self.abort_error = abort_error
+        self.rollback_broken = rollback_broken
         self.calls = []
+        self.editors = []
         self.management = self
         self.da = self
+
+    def Exists(self, path):
+        return path in self.counts
 
     def GetCount(self, path):
         return [str(self.counts.get(path, 0))]
@@ -498,7 +870,9 @@ class _FakeArcpy(object):
     def Describe(self, path):
         if self.describe_error:
             raise RuntimeError(self.describe_error)
-        return type("_Described", (object,), {"isVersioned": self.versioned})()
+        attrs = {"isVersioned": self.versioned, "path": ""}
+        attrs.update(self.attrs.get(path, {}))
+        return type("_Described", (object,), attrs)()
 
     def DeleteRows(self, path):
         self.calls.append(("DeleteRows", path))
@@ -512,9 +886,13 @@ class _FakeArcpy(object):
         self.calls.append(("Append", target, schema_type, field_mapping))
         if self.append_error:
             raise RuntimeError(self.append_error)
-        self.counts[target] = self.counts.get(source, 0)
+        self.counts[target] = self.counts.get(source, 0) - self.append_skips
 
     def ListFields(self, path):
+        if path in self.specs:
+            return [type("_Field", (object,),
+                         {"name": n, "type": t, "length": ln})()
+                    for n, t, ln in self.specs[path]]
         return [type("_Field", (object,), {"name": name})()
                 for name in self.fields]
 
@@ -523,29 +901,106 @@ class _FakeArcpy(object):
         return _FakeCursor([tuple(row[i] for i in columns)
                             for row in self.rows])
 
+    def FieldMappings(self):
+        return _FakeFieldMappings()
 
-def self_test():
-    """Assertions over the decision core. No arcpy, no geodatabase, no network."""
-    passed = [0]
-    failed = []
+    def Editor(self, workspace):
+        editor = _FakeEditor(self, workspace)
+        self.editors.append(editor)
+        return editor
 
-    def check(cond, label):
+
+class _Harness(object):
+    """The check()/raises() recorder, a class so the self-test can test it."""
+
+    def __init__(self):
+        self.passed = 0
+        self.failed = []
+
+    def check(self, cond, label):
         if cond:
-            passed[0] += 1
+            self.passed += 1
             print("PASS  %s" % label)
         else:
-            failed.append(label)
+            self.failed.append(label)
             print("FAIL  %s" % label)
 
-    def raises(fn, label):
+    def raises(self, fn, label):
         try:
             fn()
         except ValueError:
-            check(True, label)
+            self.check(True, label)
         except Exception as exc:
-            check(False, "%s (wrong exception %r)" % (label, exc))
+            self.check(False, "%s (wrong exception %r)" % (label, exc))
         else:
-            check(False, "%s (no error raised)" % label)
+            self.check(False, "%s (no error raised)" % label)
+
+    def footer(self):
+        """Print the closing line and return the process exit status."""
+        print("-" * 68)
+        total = self.passed + len(self.failed)
+        if self.failed:
+            print("%d assertions, %d failed" % (total, len(self.failed)))
+            for label in self.failed:
+                print("  FAILED: %s" % label)
+            return 1
+        print("%d assertions, 0 failed" % total)
+        return 0
+
+
+def self_test():
+    """Assertions over the decision core. No arcpy, no geodatabase, no network."""
+    harness = _Harness()
+    check = harness.check
+    raises = harness.raises
+
+    KEEP = object()
+    MISSING = object()
+
+    def set_arcpy(value):
+        """Put value in sys.modules as arcpy (MISSING removes it); return the old one."""
+        old = sys.modules.get("arcpy", MISSING)
+        if value is MISSING:
+            sys.modules.pop("arcpy", None)
+        else:
+            sys.modules["arcpy"] = value
+        return old
+
+    class _Quiet(object):
+        """Capture stdout and stderr, and put a stub arcpy in sys.modules."""
+
+        def __init__(self, stub):
+            self.stub = stub
+
+        def __enter__(self):
+            self.saved = (sys.stdout, sys.stderr)
+            sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+            self.old = KEEP if self.stub is None else set_arcpy(self.stub)
+            return self
+
+        def __exit__(self, *exc_info):
+            self.out, self.err = sys.stdout.getvalue(), sys.stderr.getvalue()
+            sys.stdout, sys.stderr = self.saved
+            if self.old is not KEEP:
+                set_arcpy(self.old)
+            return False
+
+    def error_of(fn, kind=RuntimeError):
+        """The message of the error fn raises, or "" when it raises none."""
+        try:
+            fn()
+        except kind as exc:
+            return str(exc) or kind.__name__
+        return ""
+
+    def exits(fn):
+        """True when fn ends in SystemExit, which is how argparse refuses."""
+        with _Quiet(None):
+            try:
+                fn()
+            except SystemExit:
+                return True
+        return False
 
     print("safe_republish self-test: no arcpy, no database, no network")
     print("-" * 68)
@@ -633,11 +1088,7 @@ def self_test():
     # ---- argument handling
     a = _parse(["--source", "s", "--target", "t"])
     check(a.apply is False, "--apply defaults to OFF")
-    try:
-        _parse(["--source", "s", "--target", "t", "--ap"])
-        prefix_refused = False
-    except SystemExit:
-        prefix_refused = True
+    prefix_refused = exits(lambda: _parse(["--source", "s", "--target", "t", "--ap"]))
     check(prefix_refused,
           "a unique prefix --ap of --apply is REFUSED by the parser  <-- pinned defect")
     check(a.allow_empty_target is False, "--allow-empty-target defaults to OFF")
@@ -724,12 +1175,9 @@ def self_test():
 
     # ---- THE PINNED DEFECT: a target nobody can describe is not truncated
     fake = _FakeArcpy(describe_error="ERROR 000732: the dataset does not exist")
-    try:
-        clear_target("prod.sde/Parcels", fake)
-        check(False, "a target whose Describe fails is REFUSED  <-- pinned defect")
-    except RuntimeError as exc:
-        check("prod.sde/Parcels" in str(exc),
-              "a target whose Describe fails is REFUSED  <-- pinned defect")
+    message = error_of(lambda: clear_target("prod.sde/Parcels", fake))
+    check("prod.sde/Parcels" in message,
+          "a target whose Describe fails is REFUSED  <-- pinned defect")
     check(fake.calls == [],
           "nothing was emptied when Describe could not answer")
     fake = _FakeArcpy(versioned=True)
@@ -754,16 +1202,17 @@ def self_test():
           "the configured default is still TEST after a mapped call")
     fake = _FakeArcpy(counts={"s": 100, "t": 100},
                       append_error="ERROR 000466: schema does not match")
-    try:
-        replace("s", "t", fake)
-        check(False, "a failed Append raises")
-    except RuntimeError as exc:
-        message = str(exc)
-        check("t" in message, "a failed Append names the target it cleared")
-        check("EMPTY" in message,
-              "a failed Append says the target is empty, not only that it failed")
-        check("TruncateTable" in message,
-              "a failed Append says how the target was cleared")
+    message = error_of(lambda: replace("s", "t", fake))
+    check("t" in message, "a failed Append names the target it cleared")
+    check("EMPTY" in message,
+          "a failed Append says the target is empty, not only that it failed")
+    check("TruncateTable" in message,
+          "a failed Append says how the target was cleared")
+    fake = _FakeArcpy(counts={"s": 100, "t": 100}, append_skips=1)
+    check("MISMATCH" in error_of(lambda: replace("s", "t", fake)),
+          "a plain replace whose append skipped a row reports the count mismatch")
+    check(repr(decide(100, 100)) == "Decision(ALLOW, staged=100, live=100, swing=0.0)",
+          "a decision has a readable repr")
 
     # ---- --scan: find the pattern before you have to wrap anything
     SRC = ('import arcpy\n'
@@ -846,15 +1295,466 @@ def self_test():
     raises(lambda: parse_plan("a b\n"), "a plan line with no comma raises")
     raises(lambda: parse_plan("a,b,c\n"), "a plan line with two commas raises")
 
-    print("-" * 68)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for f in failed:
-            print("  FAILED: %s" % f)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    # ---- --cover: what the append will do to each field, decided before the truncate
+    def F(name, kind="String", length=50, role=ROLE_DATA):
+        return Fld(name, kind, length, role)
+
+    def statuses(found):
+        return dict((c.field, c.status) for c in found)
+
+    sys_fields = [F("OBJECTID", "OID", 4, ROLE_SYSTEM),
+                  F("Shape", "Geometry", 0, ROLE_SYSTEM)]
+    TARGET = sys_fields + [F("NAME"), F("VALUE", "Integer", 4),
+                           F("NOTES", length=20)]
+    STAGED = sys_fields + [F("NAME"), F("VALUE", "Integer", 4)]
+
+    found = cover_fields(TARGET, STAGED)
+    check(statuses(found)["NOTES"] == COVER_NULLED,
+          "a target field nothing feeds is NULLED")
+    check([c for c in found if c.field == "NOTES"][0].refuses,
+          "a NULLED field refuses the run  <-- pinned defect")
+    check("OBJECTID" not in statuses(found) and "Shape" not in statuses(found),
+          "object id and geometry are system fields and are not judged")
+    check(statuses(found)["NAME"] == COVER_OK and statuses(found)["VALUE"] == COVER_OK,
+          "fields the staged data feeds are OK")
+    found = cover_fields(TARGET, [F("name"), F("value", "Integer", 4), F("notes", length=20)])
+    check(set(statuses(found).values()) == set([COVER_OK]),
+          "field names match without regard to case, as Append matches them")
+    check(not any(c.refuses for c in found), "a full match refuses nothing")
+
+    found = cover_fields(TARGET, [F("NAME"), F("VALUE", "String", 50), F("NOTES", length=20)])
+    check(statuses(found)["VALUE"] == COVER_TYPE and [c for c in found if c.field == "VALUE"][0].refuses,
+          "text feeding an integer field is a TYPE refusal  <-- pinned defect")
+    one = [F("A", "Integer", 4)]
+    check(cover_fields(one, [F("A", "SmallInteger", 2)])[0].status == COVER_OK,
+          "a SmallInteger may feed an Integer field")
+    check(cover_fields(one, [F("A", "BigInteger", 8)])[0].status == COVER_TYPE,
+          "a BigInteger may not feed an Integer field")
+    check(cover_fields([F("A", "SmallInteger", 2)], [F("A", "Integer", 4)])[0].status == COVER_TYPE,
+          "an Integer may not feed a SmallInteger field")
+    check(cover_fields([F("A", "Double", 8)], [F("A", "Single", 4)])[0].status == COVER_OK,
+          "a Single may feed a Double field")
+    check(cover_fields([F("A", "Double", 8)], [F("A", "BigInteger", 8)])[0].status == COVER_TYPE,
+          "a BigInteger may not feed a Double field, a double cannot hold every one")
+    check(cover_fields([F("A", "Double", 8)], [F("A", "Double", 8)])[0].status == COVER_OK,
+          "a Double feeds a Double and its length is not compared")
+
+    found = cover_fields([F("A", length=20)], [F("A", length=50)])
+    check(found[0].status == COVER_LENGTH and found[0].refuses,
+          "text declared longer than the target field is a LENGTH refusal  <-- pinned defect")
+    check(cover_fields([F("A", length=50)], [F("A", length=50)])[0].status == COVER_OK,
+          "equal text lengths are OK, the limit is inclusive")
+    check(cover_fields([F("A", length=50)], [F("A", length=10)])[0].status == COVER_OK,
+          "shorter staged text is OK")
+
+    found = cover_fields(TARGET, STAGED, allow=["notes"])
+    notes = [c for c in found if c.field == "NOTES"][0]
+    check(not notes.refuses and "accepted by --cover-allow" in notes.detail,
+          "--cover-allow accepts a NULLED field and says so")
+    check(not any(c.refuses for c in cover_fields(TARGET, STAGED, allow=[" Notes "])),
+          "--cover-allow ignores case and spaces")
+    check(cover_fields([F("A", length=20)], [F("A", length=50)], allow=["A"])[0].refuses is False,
+          "--cover-allow accepts a LENGTH finding")
+
+    found = cover_fields(TARGET, STAGED + [F("EXTRA")])
+    extra = [c for c in found if c.status == COVER_DROPPED][0]
+    check(extra.field == "EXTRA" and not extra.refuses,
+          "a staged field the target lacks is DROPPED, reported, and not a refusal under NO_TEST")
+    check(cover_fields([F("A")], [F("A"), F("X", "OID", 4, ROLE_SYSTEM)]) ==
+          [Cover(COVER_OK, "A", "", False)],
+          "a staged system field is not reported as dropped")
+
+    found = cover_fields(TARGET, STAGED, strict=True)
+    check([c for c in found if c.field == "NOTES"][0].refuses,
+          "under TEST a NULLED field refuses")
+    check([c for c in cover_fields(TARGET, STAGED, allow=["NOTES"], strict=True)
+           if c.field == "NOTES"][0].refuses,
+          "--cover-allow cannot waive a NULLED field under TEST, the append fails after the truncate  <-- pinned defect")
+    check([c for c in cover_fields(TARGET, STAGED + [F("EXTRA")], strict=True)
+           if c.status == COVER_DROPPED][0].refuses,
+          "under TEST a DROPPED field refuses, TEST rejects an extra staged field  <-- pinned defect")
+    check(cover_fields([F("A", "Integer", 4)], [F("A")], allow=["A"], strict=True)[0].refuses,
+          "--cover-allow cannot waive a TYPE finding under TEST")
+    check(cover_fields([F("A", length=20)], [F("A", length=50)], allow=["A"], strict=True)[0].refuses is False,
+          "--cover-allow can waive a LENGTH finding even under TEST, TEST does not reject it")
+
+    TRACK = [F("CREATED_BY", "String", 255, ROLE_REGENERATED),
+             F("GlobalID", "GlobalID", 38, ROLE_REGENERATED)]
+    found = cover_fields([F("A")] + TRACK, [F("A")])
+    check([c.status for c in found if c.field == "CREATED_BY"] == [COVER_REGENERATED]
+          and not any(c.refuses for c in found),
+          "tracking and global id fields are REGENERATED and reported, not refused, under NO_TEST")
+    found = cover_fields([F("A")] + TRACK, [F("A")], strict=True)
+    check(all(c.refuses for c in found if c.status == COVER_REGENERATED),
+          "tracking and global id fields the staged data lacks refuse under TEST  <-- pinned defect")
+    check(all(c.refuses for c in cover_fields([F("A")] + TRACK, [F("A")], allow=["CREATED_BY"], strict=True)
+              if c.status == COVER_REGENERATED),
+          "--cover-allow cannot waive a REGENERATED field under TEST")
+    check(not any(c.refuses for c in cover_fields([F("A")] + TRACK, [F("A")] + TRACK, strict=True)),
+          "tracking fields present in the staged data are matched like any other")
+
+    # a field map decides the feeders, not the names
+    maps = {"NAME": ["FULLNAME"], "VALUE": ["VALUE"], "NOTES": []}
+    found = cover_fields(TARGET, sys_fields + [F("FULLNAME"), F("VALUE", "Integer", 4), F("NAME")], maps)
+    check([c.status for c in found if c.field == "NAME" and c.status != COVER_DROPPED] == [COVER_OK],
+          "a mapped target field is fed by the field it names")
+    check(statuses(found)["NOTES"] == COVER_NULLED and "nothing" in
+          [c for c in found if c.field == "NOTES"][0].detail,
+          "a mapped output with no input is NULLED")
+    check([c.field for c in found if c.status == COVER_DROPPED] == ["NAME"],
+          "a staged field the map never reads is DROPPED, even with the same name as a target field")
+    found = cover_fields(TARGET, STAGED, {"NAME": ["NAME"], "VALUE": ["VALUE"]})
+    check(statuses(found)["NOTES"] == COVER_NULLED,
+          "a target field the map does not mention is NULLED")
+    found = cover_fields(TARGET, STAGED, {"NAME": ["GONE"], "VALUE": ["VALUE"], "NOTES": ["NAME"]})
+    gone = [c for c in found if c.field == "NAME"][0]
+    check(gone.status == COVER_NULLED and "GONE" in gone.detail and gone.refuses,
+          "a map reading a field the staged data lacks is NULLED and names the missing field")
+    check(all(c.status == COVER_NULLED for c in cover_fields(TARGET, STAGED, {})
+              if c.status != COVER_DROPPED),
+          "an empty field map feeds nothing")
+
+    # the verdict
+    found = cover_fields(TARGET, STAGED)
+    d = decide(100, 100, cover=found)
+    check(not d.allowed and any("NOTES NULLED" in r for r in d.reasons),
+          "decide refuses when --cover refuses and names the field")
+    check(any(r.startswith("field coverage: 2") for r in d.reasons),
+          "decide reports how many target fields are filled")
+    check(decide(100, 100, cover=cover_fields(TARGET, STAGED, allow=["NOTES"])).allowed,
+          "decide allows once the finding is accepted")
+    d = decide(100, 100, cover=cover_fields(TARGET, STAGED + [F("EXTRA")], allow=["NOTES"]))
+    check(d.allowed and any("EXTRA DROPPED" in r for r in d.reasons),
+          "decide reports a dropped staged field and still allows it under NO_TEST")
+    check(decide(100, 100, cover=[]).allowed, "an empty coverage list allows")
+    check(not decide(10, 100, cover=cover_fields(TARGET, STAGED, allow=["NOTES"])).allowed,
+          "coverage never overrides the swing check")
+
+    # ---- reading fields and field maps out of arcpy
+    specs = {"t": [("OBJECTID", "OID", 4), ("Shape", "Geometry", 0),
+                   ("NAME", "String", 50), ("GlobalID", "GlobalID", 38),
+                   ("CREATED_BY", "String", 255), ("Shape_Length", "Double", 8)],
+             "plain": [("A", "String", 5)]}
+    attrs = {"t": {"lengthFieldName": "Shape_Length", "globalIDFieldName": "GlobalID",
+                   "creatorFieldName": "CREATED_BY", "areaFieldName": ""}}
+    fake = _FakeArcpy(specs=specs, attrs=attrs)
+    roles = dict((f.name, f.role) for f in describe_fields("t", fake))
+    check(roles == {"OBJECTID": ROLE_SYSTEM, "Shape": ROLE_SYSTEM,
+                    "NAME": ROLE_DATA, "GlobalID": ROLE_REGENERATED,
+                    "CREATED_BY": ROLE_REGENERATED, "Shape_Length": ROLE_SYSTEM},
+          "fields are tagged system, regenerated or data from Describe")
+    check(describe_fields("plain", fake) == [Fld("A", "String", 5, ROLE_DATA)],
+          "a table whose Describe names no special field has only data fields")
+    fake = _FakeArcpy(describe_error="ERROR 000732")
+    check(error_of(lambda: describe_fields("t", fake)) != "",
+          "a Describe that fails while reading fields raises, it is not an empty list")
+    check(read_mapping("NAME=FULLNAME;NOTES=;SUM=A|B", "s", _FakeArcpy()) ==
+          {"NAME": ["FULLNAME"], "NOTES": [], "SUM": ["A", "B"]},
+          "a field map string is read into target name and staged field names")
+    check(read_mapping("NAME=t:NAME|s:FULLNAME;NOTES=t:NOTES", "s", _FakeArcpy()) ==
+          {"NAME": ["FULLNAME"], "NOTES": []},
+          "an input that comes from the target table feeds nothing  <-- pinned defect")
+    check(_same_table("db.gdb//Parcels", "db.gdb/./Parcels")
+          and not _same_table("db.gdb/Parcels", "db.gdb/Other"),
+          "table paths compare after normalising their slashes")
+    check(read_mapping("garbage", "s", _FakeArcpy()) == {"GARBAGE": []},
+          "garbage is read as one output field with no input, so nothing real is fed  <-- pinned defect")
+    fake = _FakeArcpy(attrs={"db.gdb/Parcels": {"path": "db.gdb"},
+                             "db.gdb/fds/Parcels": {"path": "db.gdb/fds"},
+                             "db.gdb/fds": {"path": "db.gdb", "dataType": "FeatureDataset"}})
+    check(workspace_of("db.gdb/Parcels", fake) == "db.gdb",
+          "the workspace of a top level feature class is its parent")
+    check(workspace_of("db.gdb/fds/Parcels", fake) == "db.gdb",
+          "the workspace of a feature class in a feature dataset is one level up")
+
+    # ---- --transactional: the clear and the append in one edit session
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, attrs={"t": {"path": "ws"}})
+    check(replace("s", "t", fake, transactional=True) == 100,
+          "a transactional replace returns the staged count")
+    check([c[0] for c in fake.calls] == ["DeleteRows", "Append"],
+          "a transactional replace uses DeleteRows and never TruncateTable, Pro refuses a truncate while editing")
+    log = [e[0] for e in fake.editors[0].log]
+    check(log == ["startEditing", "startOperation", "stopOperation", "stopEditing"]
+          and fake.editors[0].log[-1] == ("stopEditing", True),
+          "a successful session stops the operation and saves the edits")
+    check(fake.editors[0].log[0] == ("startEditing", False, False) and fake.editors[0].workspace == "ws",
+          "the session opens on the target's workspace, with no undo and no multiuser mode")
+    check(fake.counts["t"] == 100, "the target holds the staged rows after a committed session")
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, versioned=True)
+    replace_in_session("s", "t", fake)
+    check(fake.editors[0].log[0] == ("startEditing", False, True),
+          "a versioned target opens the session in multiuser mode")
+    fake = _FakeArcpy(counts={"s": 5, "t": 5})
+    replace_in_session("s", "t", fake, field_mapping="NAME=NAME")
+    check(fake.calls[-1][2] == "NO_TEST", "a field map sends the session's append NO_TEST too")
+
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, append_error="ERROR 000466: schema does not match")
+    message = error_of(lambda: replace("s", "t", fake, transactional=True))
+    check("rolled back" in message and "original 80" in message,
+          "a failed Append in an edit session is rolled back and the target keeps its 80 rows  <-- pinned defect")
+    check("000466" in message, "the rollback message carries the cause")
+    check(fake.counts["t"] == 80, "the target still holds its rows after the failed session")
+    check(fake.editors[0].log[-2:] == [("abortOperation",), ("stopEditing", False)],
+          "a failed session aborts the operation and discards the edits")
+    check(("stopEditing", True) not in fake.editors[0].log, "a failed session never saves")
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, append_error="boom")
+    error_of(lambda: replace("s", "t", fake))
+    check(fake.counts["t"] == 0,
+          "the plain replace leaves the target EMPTY after the same failure, which is what --transactional is for")
+
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, append_skips=1)
+    message = error_of(lambda: replace_in_session("s", "t", fake))
+    check("MISMATCH" in message and "rolled back" in message,
+          "an append that silently skips a row is rolled back, not saved  <-- pinned defect")
+    check(fake.counts["t"] == 80, "the target keeps its rows after the mismatch")
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, commit_error="disk full")
+    message = error_of(lambda: replace_in_session("s", "t", fake))
+    check("rolled back" in message and "disk full" in message,
+          "a commit that fails is rolled back")
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, append_error="boom",
+                      rollback_broken=True)
+    message = error_of(lambda: replace_in_session("s", "t", fake))
+    check("NOT be confirmed" in message and "holds 0" in message,
+          "a rollback that cannot be confirmed says so and gives both counts  <-- pinned defect")
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, append_error="boom",
+                      abort_error="no operation")
+    message = error_of(lambda: replace_in_session("s", "t", fake))
+    check("rolled back" in message and "original 80" in message,
+          "a failed abort is swallowed and the recount still reports the rolled back target")
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, edit_error="workspace is locked")
+    message = error_of(lambda: replace_in_session("s", "t", fake))
+    check("nothing was emptied" in message and "locked" in message,
+          "a session that will not open says nothing was emptied")
+    check(fake.calls == [], "no row was touched when the session would not open")
+    fake = _FakeArcpy(counts={"s": 100, "t": 80}, describe_error="ERROR 000732")
+    message = error_of(lambda: replace_in_session("s", "t", fake))
+    check("nothing will be emptied" in message,
+          "a target nobody can describe is not edited transactionally either")
+    check(fake.calls == [] and fake.editors == [], "and no session was opened for it")
+
+    globals()["VERIFY_AFTER_APPEND"] = False
+    try:
+        fake = _FakeArcpy(counts={"s": 100, "t": 80}, append_skips=1)
+        replace("s", "t", fake)
+        replace_in_session("s", "t", fake)
+        check(True, "with VERIFY_AFTER_APPEND off neither replace checks the count")
+    finally:
+        globals()["VERIFY_AFTER_APPEND"] = True
+
+    # ---- the command line, run through main() against the stub arcpy
+    def cli(argv, stub):
+        with _Quiet(stub) as q:
+            rc = main(argv)
+        return rc, q.out, q.err
+
+    def pair(**kwargs):
+        return _FakeArcpy(counts={"s": 100, "t": 100}, **kwargs)
+
+    BASE = ["--source", "s", "--target", "t"]
+    rc, out, err = cli([], pair())
+    check(rc == 64 and "both required" in err, "no source and target is a usage error")
+    rc, out, err = cli(BASE + ["--min-rows", "-1"], pair())
+    check(rc == 64 and "cannot be negative" in err, "a negative limit is a usage error")
+    rc, out, err = cli(BASE + ["--cover-allow", "NOTES"], pair())
+    check(rc == 64 and "needs --cover" in err, "--cover-allow without --cover is a usage error, never ignored")
+    rc, out, err = cli(["--source", "nope", "--target", "t"], pair())
+    check(rc == 64 and "source does not exist" in err, "a missing source is a usage error")
+    fake = pair()
+    rc, out, err = cli(BASE, fake)
+    check(rc == 0 and "Check only" in out and fake.calls == [],
+          "an allowed check without --apply touches nothing")
+    fake = pair()
+    fake.counts["s"] = 10
+    rc, out, err = cli(BASE + ["--apply"], fake)
+    check(rc == 1 and "Nothing was deleted" in out and fake.calls == [],
+          "a refused run with --apply still deletes nothing")
+    fake = pair()
+    rc, out, err = cli(BASE + ["--apply"], fake)
+    check(rc == 0 and [c[0] for c in fake.calls] == ["TruncateTable", "Append"] and "Replaced." in out,
+          "--apply truncates and appends an allowed run")
+    fake = pair(append_error="boom")
+    rc, out, err = cli(BASE + ["--apply"], fake)
+    check(rc == 2 and "EMPTY" in err, "a failed append exits 2 and says the target is empty")
+    fake = pair(append_error="boom")
+    rc, out, err = cli(BASE + ["--apply", "--transactional"], fake)
+    check(rc == 2 and "rolled back" in err and fake.counts["t"] == 100,
+          "a failed append under --transactional exits 2, says rolled back, and the target keeps its rows")
+    fake = pair()
+    rc, out, err = cli(BASE + ["--apply", "--transactional"], fake)
+    check(rc == 0 and ("DeleteRows", "t") in fake.calls and ("TruncateTable", "t") not in fake.calls,
+          "--transactional --apply clears with DeleteRows inside the session")
+    fake = pair()
+    rc, out, err = cli(BASE + ["--transactional"], fake)
+    check(rc == 0 and fake.calls == [] and fake.editors == [],
+          "--transactional without --apply opens no session and touches nothing")
+
+    SPECS = {"s": [("OBJECTID", "OID", 4), ("NAME", "String", 50)],
+             "t": [("OBJECTID", "OID", 4), ("NAME", "String", 50), ("NOTES", "String", 20)]}
+    fake = pair(specs=SPECS)
+    rc, out, err = cli(BASE + ["--cover", "--apply"], fake)
+    check(rc == 1 and "NOTES NULLED" in out and fake.calls == [],
+          "--cover refuses an unfed target field before the truncate and --apply deletes nothing  <-- pinned defect")
+    fake = pair(specs=SPECS)
+    rc, out, err = cli(BASE + ["--cover", "--cover-allow", "NOTES", "--apply"], fake)
+    check(rc == 1 and fake.calls == [],
+          "--cover-allow does not rescue a run TEST would fail, the default schema type is TEST")
+    fake = pair(specs=SPECS)
+    rc, out, err = cli(BASE + ["--cover", "--cover-allow", "NOTES", "--field-mapping", "NAME=NAME;NOTES="], fake)
+    check(rc == 0 and "accepted by --cover-allow" in out,
+          "with a field map the run is NO_TEST and --cover-allow can accept a NULLED field")
+    fake = pair(specs=SPECS)
+    rc, out, err = cli(BASE + ["--cover", "--field-mapping", "NAME=NAME;NOTES=", "--apply"], fake)
+    check(rc == 1 and fake.calls == [], "the same map without --cover-allow refuses")
+    fake = pair(specs=SPECS)
+    rc, out, err = cli(BASE + ["--cover", "--field-mapping", "garbage"], fake)
+    check(rc == 1 and "NOTES NULLED" in out and "NAME NULLED" in out and fake.calls == [],
+          "a field map that feeds no target field refuses, it does not run unchecked")
+    fake = pair(describe_error="ERROR 000732")
+    rc, out, err = cli(BASE + ["--cover"], fake)
+    check(rc == 1 and "could not read" in out, "--cover refuses when a field list cannot be read")
+    fake = pair(specs={"s": SPECS["s"], "t": SPECS["t"][:2]})
+    rc, out, err = cli(BASE + ["--cover", "--apply"], fake)
+    check(rc == 0 and "coverage: 1" in out and fake.calls[0][0] == "TruncateTable",
+          "--cover allows and --apply runs when every target field is fed")
+    fake = pair(fields=["PARCELID"], rows=[("1",), ("2",)])
+    rc, out, err = cli(BASE + ["--null-fields", "NOSUCH"], fake)
+    check(rc == 1 and "NOSUCH" in out, "--null-fields on a missing field refuses through main")
+
+    # ---- --plan through main(): the same gates for every pair
+    def plan_cli(text, stub, extra=()):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        handle.write(text)
+        handle.close()
+        try:
+            return cli(["--plan", handle.name] + list(extra), stub)
+        finally:
+            os.remove(handle.name)
+
+    def two(**kwargs):
+        return _FakeArcpy(counts={"s1": 10, "t1": 10, "s2": 20, "t2": 20}, **kwargs)
+
+    rc, out, err = cli(["--plan", os.path.join(tempfile.gettempdir(), "no-such-plan.txt")], two())
+    check(rc == 64 and "error:" in err, "a plan file that does not exist is a usage error")
+    rc, out, err = plan_cli("# only a comment\n", two())
+    check(rc == 64 and "no pairs" in err, "a plan with no pairs is a usage error")
+    rc, out, err = plan_cli("a b\n", two())
+    check(rc == 64, "a malformed plan line is a usage error")
+    rc, out, err = plan_cli("s1,t1\ns2,t1\n", two())
+    check(rc == 1 and "named twice" in out, "a plan naming a target twice is refused before anything is read")
+    rc, out, err = plan_cli("s1,t1\nsX,t2\n", two())
+    check(rc == 64 and "source does not exist" in err, "a plan naming a missing path is a usage error")
+    fake = two()
+    rc, out, err = plan_cli("s1,t1\ns2,t2\n", fake)
+    check(rc == 0 and "Check only. 2 target(s)" in out and fake.calls == [],
+          "a plan check without --apply touches nothing")
+    fake = two()
+    fake.counts["s2"] = 1
+    rc, out, err = plan_cli("s1,t1\ns2,t2\n", fake, ["--apply"])
+    check(rc == 1 and "no step ran" in out and fake.calls == [],
+          "one refused step stops the whole plan")
+    fake = two()
+    rc, out, err = plan_cli("s1,t1\ns2,t2\n", fake, ["--apply"])
+    check(rc == 0 and "Replaced 2 target(s)" in out and len([c for c in fake.calls if c[0] == "Append"]) == 2,
+          "a plan with --apply replaces every target")
+    fake = two()
+    rc, out, err = plan_cli("s1,t1\ns2,t2\n", fake, ["--apply", "--transactional"])
+    check(rc == 0 and len(fake.editors) == 2 and ("TruncateTable", "t1") not in fake.calls,
+          "a plan with --transactional gives each target its own session")
+    fake = two(append_error="boom")
+    rc, out, err = plan_cli("s1,t1\ns2,t2\n", fake, ["--apply"])
+    check(rc == 2 and "FAILED" in err, "a plan whose replace fails exits 2")
+    fake = two(fields=["PARCELID"], rows=[(None,), (None,)])
+    rc, out, err = plan_cli("s1,t1\n", fake, ["--null-fields", "PARCELID"])
+    check(rc == 1 and "NULL or blank" in out,
+          "--null-fields applies to every plan pair, it used to be ignored  <-- pinned defect")
+    fake = two(describe_error="ERROR 000732")
+    rc, out, err = plan_cli("s1,t1\n", fake, ["--cover"])
+    check(rc == 1 and "could not read" in out, "a plan pair whose fields cannot be read refuses the plan")
+
+    # ---- --scan through main(), on real files in a temporary tree
+    root = tempfile.mkdtemp()
+    try:
+        rc, out, err = cli(["--scan", os.path.join(root, "absent")], _FakeArcpy())
+        check(rc == 64 and "needs a directory" in err, "--scan on a missing directory is a usage error")
+        rc, out, err = cli(["--scan", root], _FakeArcpy())
+        check(rc == 0 and "0 file(s)" in out, "--scan on an empty tree finds nothing and exits 0")
+        with open(os.path.join(root, "counts.py"), "w") as handle:
+            handle.write("n = arcpy.GetCount_management(s)\n"
+                         "arcpy.TruncateTable_management(t)\n"
+                         "arcpy.Append_management(s, t)\n")
+        with open(os.path.join(root, "plain.py"), "w") as handle:
+            handle.write("x = 1\n")
+        with open(os.path.join(root, "notes.txt"), "w") as handle:
+            handle.write("arcpy.TruncateTable_management(t)\n")
+        rc, out, err = cli(["--scan", root], _FakeArcpy())
+        check(rc == 0 and "1 file(s), 1 truncate-then-append" in out and "counts " in out,
+              "--scan reads python files only and exits 0 when every pair counts rows")
+        with open(os.path.join(root, "blind.py"), "w") as handle:
+            handle.write("arcpy.DeleteRows_management(t)\n"
+                         "arcpy.Append_management(s, t)\n")
+        rc, out, err = cli(["--scan", root], _FakeArcpy())
+        check(rc == 1 and "BLIND " in out and "1 file(s) and 1 site(s) count no rows" in out
+              and "schema_type not on the call line" in out,
+              "--scan exits 1 and names a file that counts no rows")
+
+        def refusing_open(*args, **kwargs):
+            raise IOError("denied")
+
+        globals()["open"] = refusing_open
+        try:
+            check(scan_tree(root) == [], "a file that cannot be read is skipped, not fatal")
+        finally:
+            del globals()["open"]
+    finally:
+        for name in os.listdir(root):
+            os.remove(os.path.join(root, name))
+        os.rmdir(root)
+
+    # ---- arcpy is imported only when it is needed
+    held = set_arcpy(None)
+    exited = error_of(_import_arcpy, SystemExit)
+    stub = _FakeArcpy()
+    set_arcpy(stub)
+    returned = _import_arcpy()
+    set_arcpy(MISSING)
+    gone = "arcpy" not in sys.modules
+    set_arcpy(held)
+    check("arcpy was not found" in exited and "Only --self-test" in exited,
+          "a missing arcpy exits with the Pro Python path")
+    check(returned is stub, "an importable arcpy is returned")
+    check(gone and sys.modules.get("arcpy", MISSING) is held,
+          "the stub arcpy is removed and the real slot is put back after a test")
+
+    # ---- the new flags on the parser
+    a = _parse(BASE)
+    check(a.cover is False and a.cover_allow == "" and a.transactional is False,
+          "--cover, --cover-allow and --transactional default to off")
+    a = _parse(BASE + ["--cover", "--cover-allow", "A,B", "--transactional"])
+    check(a.cover and a.cover_allow == "A,B" and a.transactional, "the new flags are read")
+    for flag in ("--trans", "--transaction", "--cov", "--cover-al"):
+        check(exits(lambda: _parse(BASE + [flag])), "a prefix %s of a new flag is REFUSED by the parser  <-- pinned defect" % flag)
+
+    # ---- the self-test helpers
+    check(error_of(lambda: None) == "", "error_of reports no error as an empty message")
+    check(exits(lambda: None) is False, "exits reports a call that does not exit as False")
+
+    # ---- the recorder records a failure
+    inner = _Harness()
+    with _Quiet(None) as q:
+        inner.check(False, "a failing check")
+        inner.raises(lambda: None, "no error")
+        inner.raises(lambda: 1 // 0, "wrong error")
+        inner.raises(lambda: int("x"), "the right error")
+        status = inner.footer()
+    check(status == 1 and len(inner.failed) == 3 and inner.passed == 1,
+          "check() and raises() really do record a failure  <-- pinned defect")
+    check("4 assertions, 3 failed" in q.out and "FAILED: no error" in q.out,
+          "the footer reports failures by count and by name, and exits 1  <-- pinned defect")
+    with _Quiet(None) as q:
+        status = _Harness().footer()
+    check(status == 0 and "0 assertions, 0 failed" in q.out, "an empty run reports zero failures and exits 0")
+
+    return harness.footer()
 
 
 # ----------------------------------------------------------------------- cli
@@ -898,6 +1798,20 @@ def _parse(argv):
                     help="arcpy field map string passed straight to Append. "
                          "Append ignores one under TEST, so supplying it sends "
                          "this one call as NO_TEST.")
+    ap.add_argument("--cover", action="store_true",
+                    help="before the truncate, compare the staged and target "
+                         "field lists (or the --field-mapping) and refuse a "
+                         "target field nothing feeds, a type Append cannot "
+                         "convert, or text that would make Append skip rows.")
+    ap.add_argument("--cover-allow", dest="cover_allow", default="",
+                    help="comma separated target fields whose --cover finding "
+                         "you accept, for example a field left NULL on "
+                         "purpose. Needs --cover. It cannot waive what TEST "
+                         "would reject after the truncate.")
+    ap.add_argument("--transactional", action="store_true",
+                    help="clear and refill the target in one edit session, so "
+                         "a failure rolls it back. Off by default. Run on file "
+                         "and mobile geodatabases only, not on enterprise.")
     ap.add_argument("--scan", metavar="DIR",
                     help="report the truncate-then-append pairs under DIR and "
                          "which of them count no rows. Reads only.")
@@ -956,6 +1870,30 @@ def _run_scan(root):
     return 1 if blind_files else 0
 
 
+def _gather(source, target, args, arcpy):
+    """Read both sides and decide. Returns (staged, live, decision).
+
+    Shared by the single run and by --plan, so a gate asked for on the command
+    line applies to every pair. Before this, --plan ignored --null-fields.
+    """
+    staged = count_rows(source, arcpy)
+    live = count_rows(target, arcpy)
+    fields = [f.strip() for f in args.null_fields.split(",") if f.strip()]
+    null_counts = count_nulls(source, fields, arcpy) if fields else None
+    cover = None
+    if args.cover:
+        mapping = (read_mapping(args.field_mapping, source, arcpy)
+                   if args.field_mapping else None)
+        cover = cover_fields(
+            describe_fields(target, arcpy), describe_fields(source, arcpy),
+            mapping, args.cover_allow.split(","),
+            strict=APPEND_SCHEMA_TYPE == "TEST" and not args.field_mapping)
+    decision = decide(staged, live, args.min_rows, args.max_swing,
+                      args.allow_empty_target, null_counts,
+                      args.max_null_pct, cover)
+    return staged, live, decision
+
+
 def _run_plan(path, args):
     """Decide a whole batch, refusing the batch before any pair is read."""
     try:
@@ -984,9 +1922,13 @@ def _run_plan(path, args):
                 print("error: %s does not exist: %s" % (label, one),
                       file=sys.stderr)
                 return 64
-        decision = decide(count_rows(source, arcpy), count_rows(target, arcpy),
-                          args.min_rows, args.max_swing,
-                          args.allow_empty_target)
+        try:
+            _staged, _live, decision = _gather(source, target, args, arcpy)
+        except Exception as exc:
+            print("REFUSED: could not read %s -> %s: %s"
+                  % (source, target, exc))
+            print("Nothing was deleted.")
+            return 1
         decisions.append((source, target, decision))
         print("%s -> %s" % (source, target))
         for line in describe(decision):
@@ -1004,7 +1946,8 @@ def _run_plan(path, args):
     print("=== APPLY ===")
     for source, target, _decision in decisions:
         try:
-            replace(source, target, arcpy, field_mapping=args.field_mapping)
+            replace(source, target, arcpy, field_mapping=args.field_mapping,
+                    transactional=args.transactional)
         except Exception as exc:
             print("  FAILED: %s" % exc, file=sys.stderr)
             return 2
@@ -1032,6 +1975,9 @@ def main(argv=None):
         print("error: --min-rows, --max-swing and --max-null-pct cannot be "
               "negative.", file=sys.stderr)
         return 64
+    if args.cover_allow and not args.cover:
+        print("error: --cover-allow needs --cover.", file=sys.stderr)
+        return 64
 
     arcpy = _import_arcpy()
 
@@ -1040,18 +1986,15 @@ def main(argv=None):
             print("error: %s does not exist: %s" % (label, path), file=sys.stderr)
             return 64
 
-    staged = count_rows(args.source, arcpy)
-    live = count_rows(args.target, arcpy)
+    try:
+        staged, live, decision = _gather(args.source, args.target, args, arcpy)
+    except Exception as exc:
+        print("REFUSED: could not read the staged and target data: %s" % exc)
+        print("\nNothing was deleted.")
+        return 1
     print("staged source: %d row(s)" % staged)
     print("live target:   %d row(s)" % live)
     print("")
-
-    fields = [f.strip() for f in args.null_fields.split(",") if f.strip()]
-    null_counts = count_nulls(args.source, fields, arcpy) if fields else None
-
-    decision = decide(staged, live, args.min_rows, args.max_swing,
-                      args.allow_empty_target, null_counts,
-                      args.max_null_pct)
     for line in describe(decision):
         print(line)
 
@@ -1067,7 +2010,8 @@ def main(argv=None):
     print("\n=== APPLY ===")
     try:
         replace(args.source, args.target, arcpy,
-                field_mapping=args.field_mapping)
+                field_mapping=args.field_mapping,
+                transactional=args.transactional)
     except Exception as exc:
         print("  FAILED: %s" % exc, file=sys.stderr)
         return 2
@@ -1075,5 +2019,5 @@ def main(argv=None):
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
