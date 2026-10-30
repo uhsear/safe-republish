@@ -41,9 +41,11 @@ pairs before performing any of them.
     python safe_republish.py --scan C:/etl/scripts
     python safe_republish.py --plan nightly.txt --apply
 
-Exit codes: 0 allowed, 1 refused, 2 the replace failed (with --transactional the
-target was rolled back, and the message says whether that was confirmed),
-64 usage error.
+Exit codes: 0 allowed, 1 refused (or --scan found a blind site), 2 the replace
+failed (with --transactional the target was rolled back, and the message says
+whether that was confirmed), 3 the check could not run (no arcpy, data that could
+not be read, a scan that could not read every path) and nothing was touched,
+64 usage error. Every argparse refusal exits 64 too, never 2.
 """
 
 from __future__ import print_function
@@ -51,7 +53,9 @@ from __future__ import print_function
 import argparse
 import collections
 import io
+import math
 import os
+import posixpath
 import re
 import sys
 import tempfile
@@ -105,10 +109,19 @@ ROLE_REGENERATED = "regenerated"
 
 # Lossless widenings only. A staged field of the key type may feed a target field
 # of any listed type. BigInteger to Double is absent because a double cannot hold
-# every 64 bit integer. Only SmallInteger to Integer was run on Pro (README).
+# every 64 bit integer. Append NO_TEST accepts every pair listed here and writes
+# the right values (README, experiment 3).
 WIDENING = {
     "SmallInteger": ("Integer", "BigInteger", "Single", "Double"),
     "Integer": ("BigInteger", "Double"),
+    "Single": ("Double",),
+}
+
+# What Append TEST accepts besides an identical type. Measured on Pro 3.6 over all
+# 121 pairs of 11 field types (README, experiment 3). TEST rejects the other five
+# widenings above with ERROR 000466, after the truncate.
+TEST_WIDENING = {
+    "SmallInteger": ("Integer",),
     "Single": ("Double",),
 }
 
@@ -118,6 +131,7 @@ COVER_TYPE = "TYPE"
 COVER_LENGTH = "LENGTH"
 COVER_REGENERATED = "REGENERATED"
 COVER_DROPPED = "DROPPED"
+COVER_GEOMETRY = "GEOMETRY"
 
 Fld = collections.namedtuple("Fld", "name type length role")
 Cover = collections.namedtuple("Cover", "status field detail refuses")
@@ -147,13 +161,14 @@ def _import_arcpy():
     try:
         import arcpy
     except ModuleNotFoundError:
-        sys.exit(
+        print(
             "arcpy was not found. Run this with the Python that ships with "
             "ArcGIS Pro:\n"
             '  "%s" safe_republish.py\n'
             "or the propy.bat in ...\\Pro\\bin\\Python\\Scripts\\.\n"
-            "Only --self-test runs without arcpy." % PRO_PYTHON
-        )
+            "Only --self-test runs without arcpy. Nothing was touched." % PRO_PYTHON,
+            file=sys.stderr)
+        sys.exit(3)
     return arcpy
 
 
@@ -284,8 +299,9 @@ def decide(staged, live, min_rows=DEFAULT_MIN_ROWS, max_swing=DEFAULT_MAX_SWING,
 
 # --------------------------------------------------------------- field coverage
 
-def _type_fits(staged_type, target_type):
-    return staged_type == target_type or target_type in WIDENING.get(staged_type, ())
+def _type_fits(staged_type, target_type, strict=False):
+    table = TEST_WIDENING if strict else WIDENING
+    return staged_type == target_type or target_type in table.get(staged_type, ())
 
 
 def cover_fields(target, staged, mapping=None, allow=(), strict=False):
@@ -305,7 +321,8 @@ def cover_fields(target, staged, mapping=None, allow=(), strict=False):
     field, an extra field, a type mismatch, and a tracking or global id field
     the staged data lacks, so those refuse here and no allow list waives them:
     the append would fail anyway, after the truncate. TEST does not reject a
-    short text field, so LENGTH stays waivable.
+    short text field, so LENGTH stays waivable. Under TEST only the widenings in
+    TEST_WIDENING pass, because TEST rejects the other lossless ones.
 
     allow names target fields whose finding the operator accepts. It cannot
     turn a refusal TEST would repeat into an allow.
@@ -349,7 +366,7 @@ def cover_fields(target, staged, mapping=None, allow=(), strict=False):
                 "NULL after the truncate" if not inputs else
                 "is mapped from %s, which the staged data does not have"
                 % inputs[0], hard=strict)
-        elif not _type_fits(feeder.type, field.type):
+        elif not _type_fits(feeder.type, field.type, strict):
             add(COVER_TYPE, field.name,
                 "is %s in the target and %s in the staged data. Append cannot "
                 "convert some values and writes 0 or NULL without an error"
@@ -373,34 +390,55 @@ def cover_fields(target, staged, mapping=None, allow=(), strict=False):
     return found
 
 
+def cover_geometry(target_shape, staged_shape):
+    """Refuse a staged geometry type that differs from the target's.
+
+    Append writes no rows and raises no error when a polygon class feeds a point
+    class, under TEST and under NO_TEST alike, so the truncate would leave the
+    target empty (README, experiment 4). A table on either side is not a
+    mismatch, and neither is a difference in Z or M: both appended on Pro. An
+    empty shape type means the path is a table.
+    """
+    if not target_shape or not staged_shape or target_shape == staged_shape:
+        return []
+    return [Cover(
+        COVER_GEOMETRY, "Shape",
+        "is %s in the staged data and %s in the target. Append writes no rows "
+        "and raises no error, so the target would be left empty"
+        % (staged_shape, target_shape), True)]
+
+
 # Underscore is a word character, so "TruncateTable\b" never matches
 # "TruncateTable_management(", which is the spelling nearly every legacy script
-# uses. That one boundary took an earlier scan of the corpus behind this tool
-# from 179 sites to 1, so the suffix is optional here and the boundary is not.
+# uses, so the suffix is optional here and the boundary is not.
 CLEAR_CALL = re.compile(
     r"\b(TruncateTable|DeleteRows|DeleteFeatures|Delete)(?:_management)?\s*\(")
 APPEND_CALL = re.compile(r"\bAppend(?:_management)?\s*\(")
 COUNT_CALL = re.compile(r"\bGetCount(?:_management)?\s*\(")
 SCHEMA_ARG = re.compile(r"""['"](NO_TEST|TEST)['"]""")
+GATE_LINE = re.compile(r"^\s*(?:if|elif|while|assert)\b")
+ASSIGN_LINE = re.compile(r"^\s*(\w+)\s*=(?!=)(.*)$")
 
 Finding = collections.namedtuple(
-    "Finding", "clear_line clear_call append_line schema counts_rows")
+    "Finding", "clear_line clear_call append_line schema counts_rows gates")
 
 
 def mask_comments(text):
     """Blank every comment tail, leaving all other columns where they were.
 
     Line and column positions have to survive, because a finding reports them.
+    The text is split on newline only, because that is how tokenize numbers rows.
+    splitlines() also breaks on a form feed, which moved every later comment
+    onto the row above it and could blank a live truncate.
     String literals are kept, because the schema_type this looks for is one.
-    A file that will not tokenize is scanned raw rather than skipped: of the
-    743 legacy files this scanner was measured against, 5 fail to tokenize and
-    every one of those is a broken file, not a Python 2 file.
+    A file that will not tokenize is scanned raw rather than skipped, because a
+    broken file can still hold a live truncate.
     """
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
     except Exception:
         return text
-    lines = text.splitlines()
+    lines = text.split("\n")
     for token in tokens:
         if token[0] != tokenize.COMMENT:
             continue
@@ -411,17 +449,41 @@ def mask_comments(text):
     return "\n".join(lines)
 
 
+def counts_gate(lines):
+    """True when a GetCount result reaches an if, elif, while or assert line.
+
+    A count that only feeds a log line cannot refuse anything. The check follows
+    a name the count is assigned to, and a name assigned from that name, in file
+    order. It is a lexical heuristic: a count read through a cursor or len() is
+    not seen, and a branch split over several lines is not seen either, so both
+    over-report BLIND. That is the safe direction for this scan to be wrong in.
+    """
+    names = set()
+    for line in lines:
+        assign = ASSIGN_LINE.match(line)
+        feeds = COUNT_CALL.search(line) or any(
+            re.search(r"\b%s\b" % name, line) for name in names)
+        if GATE_LINE.match(line) and feeds:
+            return True
+        if assign and (COUNT_CALL.search(assign.group(2)) or any(
+                re.search(r"\b%s\b" % name, assign.group(2)) for name in names)):
+            names.add(assign.group(1))
+    return False
+
+
 def scan_source(text, window=SCAN_WINDOW):
     """Find the truncate-then-append pairs in one source file.
 
-    counts_rows is per file rather than per pair, because that is the question
-    the measurement asked: does this script count anything at all before it
-    empties a table. A commented-out clear call is not a pair, which matters:
-    a live clear in one copy of a script and a commented one in its sibling is
-    the difference that decides whether the source data survives the night.
+    counts_rows and gates are per file rather than per pair. counts_rows is
+    whether the script mentions GetCount at all. gates is whether a count
+    reaches a branch (counts_gate). A commented-out clear call is not a pair,
+    which matters: a live clear in one copy of a script and a commented one in
+    its sibling is the difference that decides whether the source data survives
+    the night.
     """
-    lines = mask_comments(text).splitlines()
+    lines = mask_comments(text).split("\n")
     counts_rows = any(COUNT_CALL.search(line) for line in lines)
+    gates = counts_gate(lines)
     appends = [n for n, line in enumerate(lines, 1) if APPEND_CALL.search(line)]
     found = []
     for number, line in enumerate(lines, 1):
@@ -434,7 +496,7 @@ def scan_source(text, window=SCAN_WINDOW):
                 schema = SCHEMA_ARG.search(near)
                 found.append(Finding(
                     number, clear.group(1), append_line,
-                    schema.group(1) if schema else None, counts_rows))
+                    schema.group(1) if schema else None, counts_rows, gates))
                 break
     return found
 
@@ -442,19 +504,20 @@ def scan_source(text, window=SCAN_WINDOW):
 def scan_summary(results):
     """Totals for a scan: (files, sites, blind files, blind sites).
 
-    Blind means the file calls GetCount nowhere, so nothing in it could have
-    refused the truncate whatever the staged data looked like.
+    Blind means no GetCount result in the file reaches a branch, so nothing in
+    it could have refused the truncate whatever the staged data looked like.
     """
     sites = sum(len(f) for _path, f in results)
-    blind = [f for _path, f in results if not f[0].counts_rows]
+    blind = [f for _path, f in results if not f[0].gates]
     return len(results), sites, len(blind), sum(len(f) for f in blind)
 
 
 def parse_plan(text):
-    """Read a plan: one "source,target" pair per line, # comments ignored."""
+    """Read a plan: one "source,target" pair per line. A comment starts with #
+    at the start of a line or after a space, so a # inside a path survives."""
     pairs = []
     for number, line in enumerate(text.splitlines(), 1):
-        line = line.split("#", 1)[0].strip()
+        line = re.split(r"(?:^|\s)#", line, maxsplit=1)[0].strip()
         if not line:
             continue
         if line.count(",") != 1:
@@ -480,13 +543,18 @@ def check_plan(pairs):
         if not source or not target:
             reasons.append("step %d names an empty source or target" % index)
             continue
-        if target in seen:
+        if _same_table(source, target):
+            reasons.append(
+                "step %d reads and writes the same table, %s. The truncate "
+                "would empty it before the append reads it." % (index, target))
+        key = _table_key(target)
+        if key in seen:
             reasons.append(
                 "target %s is named twice, by step %d and step %d. The second "
                 "truncate would destroy what the first append wrote."
-                % (target, seen[target], index))
+                % (target, seen[key], index))
         else:
-            seen[target] = index
+            seen[key] = index
     return reasons
 
 
@@ -513,17 +581,22 @@ def count_nulls(path, fields, arcpy):
     field was renamed the guard that watched it stopped running and said
     nothing. decide() refuses a None.
 
+    Names compare without case, as Append and --cover compare them. The count is
+    keyed by the name the caller typed.
+
     Blank counts with NULL. A join whose key format changed writes empty text
     as readily as it writes NULL, and neither one is data.
     """
-    present = set(field.name for field in arcpy.ListFields(path))
-    counts = dict((name, None) for name in fields if name not in present)
-    readable = [name for name in fields if name in present]
+    real = dict((field.name.upper(), field.name)
+                for field in arcpy.ListFields(path))
+    counts = dict((name, None) for name in fields if name.upper() not in real)
+    readable = [name for name in fields if name.upper() in real]
     if not readable:
         return counts
     for name in readable:
         counts[name] = 0
-    with arcpy.da.SearchCursor(path, readable) as rows:
+    cursor_names = [real[name.upper()] for name in readable]
+    with arcpy.da.SearchCursor(path, cursor_names) as rows:
         for row in rows:
             for name, value in zip(readable, row):
                 if value is None or (isinstance(value, str) and not value.strip()):
@@ -582,9 +655,19 @@ def describe_fields(path, arcpy):
     return fields
 
 
+def _table_key(path):
+    """A path with its slashes, dots and case flattened. Geodatabase names are
+    not case sensitive. posixpath keeps this the same on every host."""
+    return posixpath.normpath(path.replace("\\", "/")).lower()
+
+
 def _same_table(left, right):
-    return (os.path.normcase(os.path.normpath(left))
-            == os.path.normcase(os.path.normpath(right)))
+    return _table_key(left) == _table_key(right)
+
+
+def shape_type(path, arcpy):
+    """The geometry type of a feature class, or "" for a table."""
+    return getattr(arcpy.Describe(path), "shapeType", "")
 
 
 def read_mapping(text, source, arcpy):
@@ -842,7 +925,7 @@ class _FakeArcpy(object):
     def __init__(self, counts=None, versioned=False, describe_error=None,
                  append_error=None, fields=(), rows=(), specs=None, attrs=None,
                  append_skips=0, edit_error=None, commit_error=None,
-                 abort_error=None, rollback_broken=False):
+                 abort_error=None, rollback_broken=False, exists_error=None):
         self.counts = dict(counts or {})
         self.versioned = versioned
         self.describe_error = describe_error
@@ -856,12 +939,15 @@ class _FakeArcpy(object):
         self.commit_error = commit_error
         self.abort_error = abort_error
         self.rollback_broken = rollback_broken
+        self.exists_error = exists_error
         self.calls = []
         self.editors = []
         self.management = self
         self.da = self
 
     def Exists(self, path):
+        if self.exists_error:
+            raise RuntimeError(self.exists_error)
         return path in self.counts
 
     def GetCount(self, path):
@@ -1001,6 +1087,15 @@ def self_test():
             except SystemExit:
                 return True
         return False
+
+    def exit_of(fn):
+        """(exit code, stderr) of a call that ends in SystemExit, else (None, "")."""
+        with _Quiet(None) as q:
+            try:
+                fn()
+            except SystemExit as exc:
+                return exc.code, sys.stderr.getvalue()
+        return None, q.err
 
     print("safe_republish self-test: no arcpy, no database, no network")
     print("-" * 68)
@@ -1173,6 +1268,12 @@ def self_test():
     check(counts["PARCELID"] == 0 and counts["NOSUCH"] is None,
           "a missing field does not stop the fields that are there")
 
+    fake = _FakeArcpy(fields=["PARCELID", "Owner"], rows=[(None, "x"), ("1", " ")])
+    check(count_nulls("s", ["parcelid", "OWNER"], fake) == {"parcelid": 1, "OWNER": 1},
+          "--null-fields matches a field without regard to case and reads it  <-- pinned defect")
+    check(count_nulls("s", ["nosuch"], fake) == {"nosuch": None},
+          "a field that is genuinely absent is still None after the case change")
+
     # ---- THE PINNED DEFECT: a target nobody can describe is not truncated
     fake = _FakeArcpy(describe_error="ERROR 000732: the dataset does not exist")
     message = error_of(lambda: clear_target("prod.sde/Parcels", fake))
@@ -1269,10 +1370,39 @@ def self_test():
     check(scan_source("x = 1\n") == [], "a file with no pair reports nothing")
     check(mask_comments('a = 1  # note\nb = 2\n').splitlines()[1] == "b = 2",
           "masking a comment leaves the following lines where they were")
-    check(mask_comments('s = "# not a comment"\n') == 's = "# not a comment"',
+    FEED = ('x = 1\n\x0c\narcpy.TruncateTable_management(t)\n'
+            'z = 0  # a long trailing comment\narcpy.Append_management(s, t)\n')
+    check(len(scan_source(FEED)) == 1 and scan_source(FEED)[0].clear_line == 3,
+          "a form feed does not shift the masked rows and hide a live truncate  <-- pinned defect")
+    check(mask_comments('s = "# not a comment"\n') == 's = "# not a comment"\n',
           "a hash inside a string literal is not a comment")
+    PAIR = 'arcpy.TruncateTable_management(t)\narcpy.Append_management(s, t)\n'
+    log_only = scan_source('print("rows", arcpy.GetCount_management(s))\n' + PAIR)[0]
+    check(log_only.counts_rows and not log_only.gates,
+          "a GetCount that only feeds a log line does not gate the truncate  <-- pinned defect")
+    check(scan_source('if int(arcpy.GetCount_management(s)[0]) < 5:\n    pass\n' + PAIR)[0].gates,
+          "a GetCount inside an if line gates")
+    check(scan_source('assert int(arcpy.management.GetCount(s)[0]) > 0\n' + PAIR)[0].gates,
+          "a GetCount inside an assert line gates")
+    check(scan_source('n = int(arcpy.GetCount_management(s)[0])\nif n == 0:\n    raise SystemExit\n' + PAIR)[0].gates,
+          "a count assigned to a name that an if line reads gates")
+    check(scan_source('r = arcpy.GetCount_management(s)\nn = int(r[0])\nwhile n < 1:\n    pass\n' + PAIR)[0].gates,
+          "a name assigned from a counted name is followed to the branch that reads it")
+    check(not scan_source('n = int(arcpy.GetCount_management(s)[0])\nprint(n)\n' + PAIR)[0].gates,
+          "a counted name that no branch reads does not gate")
+    check(not scan_source('if x == 1:\n    pass\n' + PAIR)[0].gates
+          and not scan_source('n = len(list(rows))\nif n < 5:\n    pass\n' + PAIR)[0].gates,
+          "a branch with no GetCount behind it does not gate, a len() count is BLIND")
+    edge = 'arcpy.TruncateTable_management(t)\n' + 'x = 1\n' * 11
+    check(len(scan_source(edge + 'arcpy.Append_management(s, t)\n')) == 1
+          and scan_source(edge + 'x = 1\narcpy.Append_management(s, t)\n') == [],
+          "an append exactly 12 lines after the clear is a pair and 13 is not, the window is inclusive")
+    check(len(scan_source(PAIR, window=1)) == 1 and scan_source(PAIR, window=0) == [],
+          "a window of 1 reaches the next line and a window of 0 reaches nothing")
+
     results = [("a.py", scan_source(SRC)), ("b.py", scan_source(
-        'n = arcpy.GetCount_management(s)\n'
+        'if int(arcpy.GetCount_management(s)[0]) < 10:\n'
+        '    sys.exit(1)\n'
         'arcpy.TruncateTable_management(t)\n'
         'arcpy.Append_management(s, t)\n'))]
     check(scan_summary(results) == (2, 2, 1, 1),
@@ -1286,12 +1416,21 @@ def self_test():
     check(any("step 1" in p and "step 2" in p for p in problems),
           "the plan refusal names both steps that collide")
     check(any("t1" in p for p in problems), "the plan refusal names the target")
+    check(check_plan([("s1", "db.gdb/T"), ("s2", "DB.GDB//t")]),
+          "a plan naming one target in two spellings REFUSES, slashes and case do not hide it  <-- pinned defect")
+    check(check_plan([("s1", "db.gdb/T"), ("s2", "db.gdb/./t")]),
+          "a dot segment does not hide a repeated target either")
+    problems = check_plan([("db.gdb/A", "DB.GDB\\a")])
+    check(problems and "same table" in problems[0],
+          "a plan step that reads and writes one table REFUSES  <-- pinned defect")
     check(check_plan([("s", "")]), "a plan step with no target refuses")
     check(check_plan([("", "t")]), "a plan step with no source refuses")
     check(parse_plan("a,b\nc,d\n") == [("a", "b"), ("c", "d")],
           "a plan file reads one source,target pair per line")
     check(parse_plan("# nightly\n\n a , b \n") == [("a", "b")],
           "a plan file ignores comments, blank lines and spacing")
+    check(parse_plan("d/x#1.gdb/a,d/y.gdb/b # note\n") == [("d/x#1.gdb/a", "d/y.gdb/b")],
+          "a # inside a plan path is part of the path, a comment needs a space before it  <-- pinned defect")
     raises(lambda: parse_plan("a b\n"), "a plan line with no comma raises")
     raises(lambda: parse_plan("a,b,c\n"), "a plan line with two commas raises")
 
@@ -1328,6 +1467,17 @@ def self_test():
     one = [F("A", "Integer", 4)]
     check(cover_fields(one, [F("A", "SmallInteger", 2)])[0].status == COVER_OK,
           "a SmallInteger may feed an Integer field")
+    for wide in (("SmallInteger", "BigInteger"), ("SmallInteger", "Single"),
+                 ("SmallInteger", "Double"), ("Integer", "BigInteger"),
+                 ("Integer", "Double")):
+        check(cover_fields([F("A", wide[1], 8)], [F("A", wide[0], 4)])[0].status == COVER_OK
+              and cover_fields([F("A", wide[1], 8)], [F("A", wide[0], 4)],
+                               strict=True)[0].refuses,
+              "%s into %s passes NO_TEST and refuses under TEST, which rejects it after the truncate  <-- pinned defect"
+              % wide)
+    check(cover_fields(one, [F("A", "SmallInteger", 2)], strict=True)[0].status == COVER_OK
+          and cover_fields([F("A", "Double", 8)], [F("A", "Single", 4)], strict=True)[0].status == COVER_OK,
+          "SmallInteger into Integer and Single into Double pass under TEST, as Append TEST accepts them")
     check(cover_fields(one, [F("A", "BigInteger", 8)])[0].status == COVER_TYPE,
           "a BigInteger may not feed an Integer field")
     check(cover_fields([F("A", "SmallInteger", 2)], [F("A", "Integer", 4)])[0].status == COVER_TYPE,
@@ -1385,13 +1535,25 @@ def self_test():
           and not any(c.refuses for c in found),
           "tracking and global id fields are REGENERATED and reported, not refused, under NO_TEST")
     found = cover_fields([F("A")] + TRACK, [F("A")], strict=True)
-    check(all(c.refuses for c in found if c.status == COVER_REGENERATED),
+    regen = [c for c in found if c.status == COVER_REGENERATED]
+    check(len(regen) == 2 and all(c.refuses for c in regen),
           "tracking and global id fields the staged data lacks refuse under TEST  <-- pinned defect")
-    check(all(c.refuses for c in cover_fields([F("A")] + TRACK, [F("A")], allow=["CREATED_BY"], strict=True)
-              if c.status == COVER_REGENERATED),
-          "--cover-allow cannot waive a REGENERATED field under TEST")
+    regen = [c for c in cover_fields([F("A")] + TRACK, [F("A")], allow=["CREATED_BY"], strict=True)
+             if c.status == COVER_REGENERATED]
+    check(len(regen) == 2 and all(c.refuses for c in regen),
+          "--cover-allow cannot waive a REGENERATED field under TEST  <-- pinned defect")
     check(not any(c.refuses for c in cover_fields([F("A")] + TRACK, [F("A")] + TRACK, strict=True)),
           "tracking fields present in the staged data are matched like any other")
+
+    check(cover_geometry("Point", "Polygon")[0].refuses
+          and cover_geometry("Point", "Polygon")[0].status == COVER_GEOMETRY,
+          "a polygon class feeding a point class refuses, Append writes no rows and no error  <-- pinned defect")
+    check(cover_geometry("Point", "Point") == [] and cover_geometry("", "Point") == []
+          and cover_geometry("Point", "") == [],
+          "the same geometry type, or a table on either side, is not a geometry finding")
+    d = decide(100, 100, cover=cover_geometry("Point", "Polygon"))
+    check(not d.allowed and any("Shape GEOMETRY" in r for r in d.reasons),
+          "decide refuses a geometry mismatch and names it")
 
     # a field map decides the feeders, not the names
     maps = {"NAME": ["FULLNAME"], "VALUE": ["VALUE"], "NOTES": []}
@@ -1553,12 +1715,27 @@ def self_test():
     BASE = ["--source", "s", "--target", "t"]
     rc, out, err = cli([], pair())
     check(rc == 64 and "both required" in err, "no source and target is a usage error")
+    rc, out, err = cli(["--max-swing", "-1"], pair())
+    check(rc == 64 and "cannot be negative" in err, "a negative limit is a usage error even before the paths")
     rc, out, err = cli(BASE + ["--min-rows", "-1"], pair())
     check(rc == 64 and "cannot be negative" in err, "a negative limit is a usage error")
     rc, out, err = cli(BASE + ["--cover-allow", "NOTES"], pair())
     check(rc == 64 and "needs --cover" in err, "--cover-allow without --cover is a usage error, never ignored")
+    rc, out, err = cli(["--source", "s"], pair())
+    check(rc == 64 and "both required" in err, "a source with no target is a usage error")
     rc, out, err = cli(["--source", "nope", "--target", "t"], pair())
     check(rc == 64 and "source does not exist" in err, "a missing source is a usage error")
+    fake = pair()
+    rc, out, err = cli(["--source", "s", "--target", "s", "--apply"], fake)
+    check(rc == 64 and "same table" in err and fake.calls == [],
+          "a source that is also the target is refused before any delete  <-- pinned defect")
+    fake = pair()
+    rc, out, err = cli(["--source", "db.gdb/S", "--target", "DB.GDB\\s", "--apply"], fake)
+    check(rc == 64 and "same table" in err and fake.calls == [],
+          "the same table spelled with other slashes and case is refused too  <-- pinned defect")
+    rc, out, err = cli(BASE, pair(exists_error="dead connection file"))
+    check(rc == 3 and "COULD NOT CHECK" in out and "dead connection file" in out,
+          "a path arcpy cannot test exits 3 and says nothing was deleted")
     fake = pair()
     rc, out, err = cli(BASE, fake)
     check(rc == 0 and "Check only" in out and fake.calls == [],
@@ -1610,8 +1787,18 @@ def self_test():
     check(rc == 1 and "NOTES NULLED" in out and "NAME NULLED" in out and fake.calls == [],
           "a field map that feeds no target field refuses, it does not run unchecked")
     fake = pair(describe_error="ERROR 000732")
-    rc, out, err = cli(BASE + ["--cover"], fake)
-    check(rc == 1 and "could not read" in out, "--cover refuses when a field list cannot be read")
+    rc, out, err = cli(BASE + ["--cover", "--apply"], fake)
+    check(rc == 3 and "could not read" in out and "Nothing was deleted" in out and fake.calls == [],
+          "--cover exits 3 when a field list cannot be read, not 1 and not a traceback  <-- pinned defect")
+    fake = pair(specs={"s": SPECS["s"], "t": SPECS["t"][:2]},
+                attrs={"s": {"shapeType": "Polygon"}, "t": {"shapeType": "Point"}})
+    rc, out, err = cli(BASE + ["--cover", "--apply"], fake)
+    check(rc == 1 and "Shape GEOMETRY" in out and fake.calls == [],
+          "--cover refuses a polygon class into a point target and --apply deletes nothing  <-- pinned defect")
+    fake = pair(fields=["PARCELID"], rows=[("1",), ("2",)])
+    rc, out, err = cli(BASE + ["--null-fields", "parcelid"], fake)
+    check(rc == 0 and "no such field" not in out,
+          "--null-fields parcelid finds a field named PARCELID  <-- pinned defect")
     fake = pair(specs={"s": SPECS["s"], "t": SPECS["t"][:2]})
     rc, out, err = cli(BASE + ["--cover", "--apply"], fake)
     check(rc == 0 and "coverage: 1" in out and fake.calls[0][0] == "TruncateTable",
@@ -1641,6 +1828,22 @@ def self_test():
     check(rc == 64, "a malformed plan line is a usage error")
     rc, out, err = plan_cli("s1,t1\ns2,t1\n", two())
     check(rc == 1 and "named twice" in out, "a plan naming a target twice is refused before anything is read")
+    fake = two()
+    rc, out, err = plan_cli("s1,t1\ns2,T1\n", fake, ["--apply"])
+    check(rc == 1 and "named twice" in out and fake.calls == [],
+          "a plan naming a target twice in another case is refused too  <-- pinned defect")
+    fake = two()
+    rc, out, err = plan_cli("s1,s1\n", fake, ["--apply"])
+    check(rc == 1 and "same table" in out and fake.calls == [],
+          "a plan step whose source is its target is refused  <-- pinned defect")
+    rc, out, err = plan_cli("s1,t1\n", two(), ["--max-swing", "-1"])
+    check(rc == 64 and "cannot be negative" in err,
+          "--plan refuses a negative threshold as a usage error, not as an unreadable pair  <-- pinned defect")
+    rc, out, err = plan_cli("s1,t1\n", two(), ["--cover-allow", "X"])
+    check(rc == 64 and "needs --cover" in err,
+          "--plan refuses --cover-allow without --cover, it used to be ignored  <-- pinned defect")
+    rc, out, err = plan_cli("s1,t1\n", two(exists_error="dead connection file"))
+    check(rc == 3 and "COULD NOT CHECK" in out, "a plan path arcpy cannot test exits 3")
     rc, out, err = plan_cli("s1,t1\nsX,t2\n", two())
     check(rc == 64 and "source does not exist" in err, "a plan naming a missing path is a usage error")
     fake = two()
@@ -1669,7 +1872,8 @@ def self_test():
           "--null-fields applies to every plan pair, it used to be ignored  <-- pinned defect")
     fake = two(describe_error="ERROR 000732")
     rc, out, err = plan_cli("s1,t1\n", fake, ["--cover"])
-    check(rc == 1 and "could not read" in out, "a plan pair whose fields cannot be read refuses the plan")
+    check(rc == 3 and "could not read" in out and fake.calls == [],
+          "a plan pair whose fields cannot be read exits 3 and deletes nothing")
 
     # ---- --scan through main(), on real files in a temporary tree
     root = tempfile.mkdtemp()
@@ -1679,32 +1883,53 @@ def self_test():
         rc, out, err = cli(["--scan", root], _FakeArcpy())
         check(rc == 0 and "0 file(s)" in out, "--scan on an empty tree finds nothing and exits 0")
         with open(os.path.join(root, "counts.py"), "w") as handle:
-            handle.write("n = arcpy.GetCount_management(s)\n"
+            handle.write("if int(arcpy.GetCount_management(s)[0]) < 10:\n"
+                         "    sys.exit(1)\n"
                          "arcpy.TruncateTable_management(t)\n"
                          "arcpy.Append_management(s, t)\n")
         with open(os.path.join(root, "plain.py"), "w") as handle:
             handle.write("x = 1\n")
         with open(os.path.join(root, "notes.txt"), "w") as handle:
-            handle.write("arcpy.TruncateTable_management(t)\n")
+            handle.write("arcpy.TruncateTable_management(t)\n"
+                         "arcpy.Append_management(s, t)\n")
         rc, out, err = cli(["--scan", root], _FakeArcpy())
-        check(rc == 0 and "1 file(s), 1 truncate-then-append" in out and "counts " in out,
+        check(rc == 0 and "1 file(s), 1 truncate-then-append" in out and "gated " in out,
               "--scan reads python files only and exits 0 when every pair counts rows")
         with open(os.path.join(root, "blind.py"), "w") as handle:
             handle.write("arcpy.DeleteRows_management(t)\n"
                          "arcpy.Append_management(s, t)\n")
         rc, out, err = cli(["--scan", root], _FakeArcpy())
-        check(rc == 1 and "BLIND " in out and "1 file(s) and 1 site(s) count no rows" in out
+        check(rc == 1 and "BLIND " in out and "1 file(s) and 1 site(s) have no row count" in out
               and "schema_type not on the call line" in out,
-              "--scan exits 1 and names a file that counts no rows")
+              "--scan exits 1 and names a file that has no row count behind a branch")
+        with open(os.path.join(root, "logged.py"), "w") as handle:
+            handle.write("print(arcpy.GetCount_management(s))\n"
+                         "arcpy.TruncateTable_management(t)\n"
+                         "arcpy.Append_management(s, t)\n")
+        rc, out, err = cli(["--scan", root], _FakeArcpy())
+        check(rc == 1 and "GetCount appears, but no if, elif, while or assert reads it" in out,
+              "--scan marks a file whose only GetCount feeds a log line as BLIND  <-- pinned defect")
 
         def refusing_open(*args, **kwargs):
             raise IOError("denied")
 
+        lost = []
         globals()["open"] = refusing_open
         try:
-            check(scan_tree(root) == [], "a file that cannot be read is skipped, not fatal")
+            check(scan_tree(root, unreadable=lost) == [] and len(lost) == 4,
+                  "a file that cannot be read is skipped, not fatal, and is named in the unreadable list")
+            os.remove(os.path.join(root, "blind.py"))
+            os.remove(os.path.join(root, "logged.py"))
+            rc, out, err = cli(["--scan", root], _FakeArcpy())
+            check(rc == 3 and "UNREADABLE" in out and "NOT complete" in out,
+                  "--scan exits 3 and says the scan is incomplete when it could not read a file  <-- pinned defect")
         finally:
             del globals()["open"]
+        lost = []
+        scan_tree(os.path.join(root, "absent"), unreadable=lost)
+        check(len(lost) == 1,
+              "a directory os.walk cannot list is named in the unreadable list  <-- pinned defect")
+        check(scan_tree(root) is not None, "scan_tree needs no unreadable list")
     finally:
         for name in os.listdir(root):
             os.remove(os.path.join(root, name))
@@ -1712,15 +1937,15 @@ def self_test():
 
     # ---- arcpy is imported only when it is needed
     held = set_arcpy(None)
-    exited = error_of(_import_arcpy, SystemExit)
+    code, text = exit_of(_import_arcpy)
     stub = _FakeArcpy()
     set_arcpy(stub)
     returned = _import_arcpy()
     set_arcpy(MISSING)
     gone = "arcpy" not in sys.modules
     set_arcpy(held)
-    check("arcpy was not found" in exited and "Only --self-test" in exited,
-          "a missing arcpy exits with the Pro Python path")
+    check(code == 3 and "arcpy was not found" in text and "Only --self-test" in text,
+          "a missing arcpy exits 3 with the Pro Python path, 1 is for a refusal  <-- pinned defect")
     check(returned is stub, "an importable arcpy is returned")
     check(gone and sys.modules.get("arcpy", MISSING) is held,
           "the stub arcpy is removed and the real slot is put back after a test")
@@ -1734,9 +1959,62 @@ def self_test():
     for flag in ("--trans", "--transaction", "--cov", "--cover-al"):
         check(exits(lambda: _parse(BASE + [flag])), "a prefix %s of a new flag is REFUSED by the parser  <-- pinned defect" % flag)
 
+    for flag in ("--appl", "--ap", "--bogus"):
+        check(exit_of(lambda: _parse(BASE + [flag]))[0] == 64,
+              "an argparse refusal of %s exits 64, never 2  <-- pinned defect" % flag)
+    check(exit_of(lambda: _parse(BASE + ["--max-swing", "abc"]))[0] == 64,
+          "a non-numeric --max-swing exits 64")
+    for bad in ("nan", "inf"):
+        code, text = exit_of(lambda: _parse(BASE + ["--max-swing", bad]))
+        check(code == 64 and "finite" in text,
+              "--max-swing %s is a usage error, a non-finite threshold used to switch its check off  <-- pinned defect" % bad)
+    check(exit_of(lambda: _parse(BASE + ["--max-null-pct", "nan"]))[0] == 64,
+          "--max-null-pct nan is a usage error")
+    check(_parse(BASE + ["--max-swing", "0.2"]).max_swing == 0.2, "a finite --max-swing is read")
+
+    def with_env(name, value, fn):
+        held = os.environ.get(name)
+        os.environ[name] = value
+        try:
+            return fn()
+        finally:
+            if held is None:
+                del os.environ[name]
+            else:
+                os.environ[name] = held
+
+    for name in ("SAFE_REPUBLISH_MIN_ROWS", "SAFE_REPUBLISH_MAX_SWING", "SAFE_REPUBLISH_MAX_NULL_PCT"):
+        code, text = with_env(name, "15%", lambda: exit_of(lambda: _parse(["--self-test"])))
+        check(code == 64 and name in text,
+              "%s=15%% exits 64 and names the variable, it used to be a traceback  <-- pinned defect" % name)
+    code, text = with_env("SAFE_REPUBLISH_MAX_SWING", "nan", lambda: exit_of(lambda: _parse(["--self-test"])))
+    check(code == 64, "SAFE_REPUBLISH_MAX_SWING=nan exits 64")
+    check(with_env("SAFE_REPUBLISH_MAX_SWING", "0.3", lambda: _parse(BASE)).max_swing == 0.3
+          and with_env("SAFE_REPUBLISH_MIN_ROWS", "9", lambda: _parse(BASE)).min_rows == 9,
+          "a plain number in the environment is the default, and a flag still wins")
+    check(with_env("SAFE_REPUBLISH_MAX_SWING", "0.3",
+                   lambda: _parse(BASE + ["--max-swing", "0.4"])).max_swing == 0.4,
+          "a flag beats the environment")
+
+    # ---- small boundaries that decide a verdict or its text
+    check("swings 20.0%" in " ".join(decide(80, 100, max_swing=0.1).reasons)
+          and "limit of 10.0%" in " ".join(decide(80, 100, max_swing=0.1).reasons),
+          "the refusal text shows the swing and the limit as percentages")
+
+    class _Bare(object):
+        def Describe(self, path):
+            return object()
+
+    check(is_versioned("t", _Bare()) is False, "a Describe with no isVersioned attribute is not versioned")
+
     # ---- the self-test helpers
     check(error_of(lambda: None) == "", "error_of reports no error as an empty message")
     check(exits(lambda: None) is False, "exits reports a call that does not exit as False")
+    check(exit_of(lambda: None) == (None, ""), "exit_of reports a call that does not exit as no code")
+    check(with_env("SAFE_REPUBLISH_MAX_SWING", "0.3", lambda: with_env(
+        "SAFE_REPUBLISH_MAX_SWING", "0.4", lambda: _parse(BASE).max_swing)) == 0.4
+          and os.environ.get("SAFE_REPUBLISH_MAX_SWING") is None,
+          "with_env puts back a variable that was already set, and removes one that was not")
 
     # ---- the recorder records a failure
     inner = _Harness()
@@ -1759,8 +2037,37 @@ def self_test():
 
 # ----------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 for a usage error, and 2 here means the replace failed.
+    A cron wrapper that reads 2 would go looking for an empty target."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+
+
+def _finite(text):
+    value = float(text)
+    if math.isnan(value) or math.isinf(value):
+        raise argparse.ArgumentTypeError(
+            "%r is not a finite number. Pass a plain number such as 0.15." % text)
+    return value
+
+
+def _env_default(ap, name, kind, default):
+    """The environment value for name, or default. A value that is not a plain
+    number is a usage error that names the variable, not a traceback."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return kind(raw)
+    except (ValueError, argparse.ArgumentTypeError):
+        ap.error("%s=%r is not a plain finite number" % (name, raw))
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="safe_republish.py",
         allow_abbrev=False,
         description="Refuse to truncate a feature class when the staged "
@@ -1772,14 +2079,14 @@ def _parse(argv):
     ap.add_argument("--target",
                     help="feature class that would be emptied and refilled")
     ap.add_argument("--min-rows", dest="min_rows", type=int,
-                    default=int(os.environ.get("SAFE_REPUBLISH_MIN_ROWS",
-                                               DEFAULT_MIN_ROWS)),
+                    default=_env_default(ap, "SAFE_REPUBLISH_MIN_ROWS", int,
+                                         DEFAULT_MIN_ROWS),
                     help="absolute row floor for the staged data "
                          "(default %d). Env: SAFE_REPUBLISH_MIN_ROWS"
                          % DEFAULT_MIN_ROWS)
-    ap.add_argument("--max-swing", dest="max_swing", type=float,
-                    default=float(os.environ.get("SAFE_REPUBLISH_MAX_SWING",
-                                                 DEFAULT_MAX_SWING)),
+    ap.add_argument("--max-swing", dest="max_swing", type=_finite,
+                    default=_env_default(ap, "SAFE_REPUBLISH_MAX_SWING", _finite,
+                                         DEFAULT_MAX_SWING),
                     help="largest allowed relative change against the live "
                          "count, as a fraction (default %.2f). "
                          "Env: SAFE_REPUBLISH_MAX_SWING" % DEFAULT_MAX_SWING)
@@ -1787,9 +2094,9 @@ def _parse(argv):
                     help="comma separated fields whose NULL or blank fraction "
                          "is checked in the staged data. A field named here "
                          "that the staged data does not have REFUSES.")
-    ap.add_argument("--max-null-pct", dest="max_null_pct", type=float,
-                    default=float(os.environ.get("SAFE_REPUBLISH_MAX_NULL_PCT",
-                                                 DEFAULT_MAX_NULL_PCT)),
+    ap.add_argument("--max-null-pct", dest="max_null_pct", type=_finite,
+                    default=_env_default(ap, "SAFE_REPUBLISH_MAX_NULL_PCT",
+                                         _finite, DEFAULT_MAX_NULL_PCT),
                     help="largest allowed NULL or blank fraction for each "
                          "--null-fields field (default %.2f). "
                          "Env: SAFE_REPUBLISH_MAX_NULL_PCT"
@@ -1830,10 +2137,18 @@ def _parse(argv):
     return ap.parse_args(argv)
 
 
-def scan_tree(root, window=SCAN_WINDOW):
-    """Walk a tree and return (path, findings) for each file holding a pair."""
+def scan_tree(root, window=SCAN_WINDOW, unreadable=None):
+    """Walk a tree and return (path, findings) for each file holding a pair.
+
+    A file or directory that cannot be read is appended to unreadable when a
+    list is passed. Skipping it silently would report a clean tree that was
+    never fully read.
+    """
     results = []
-    for dirpath, _dirnames, filenames in os.walk(root):
+    if unreadable is None:
+        unreadable = []
+    for dirpath, _dirnames, filenames in os.walk(
+            root, onerror=lambda exc: unreadable.append(exc.filename)):
         for name in sorted(filenames):
             if not name.lower().endswith(".py"):
                 continue
@@ -1842,6 +2157,7 @@ def scan_tree(root, window=SCAN_WINDOW):
                 with open(path, "rb") as handle:
                     text = handle.read().decode("utf-8", "replace")
             except IOError:
+                unreadable.append(path)
                 continue
             findings = scan_source(text, window)
             if findings:
@@ -1854,10 +2170,13 @@ def _run_scan(root):
     if not os.path.isdir(root):
         print("error: --scan needs a directory: %s" % root, file=sys.stderr)
         return 64
-    results = scan_tree(root)
+    unreadable = []
+    results = scan_tree(root, unreadable=unreadable)
     for path, findings in results:
-        blind = not findings[0].counts_rows
-        print("%s %s" % ("BLIND " if blind else "counts", path))
+        blind = not findings[0].gates
+        print("%s %s" % ("BLIND " if blind else "gated ", path))
+        if blind and findings[0].counts_rows:
+            print("    GetCount appears, but no if, elif, while or assert reads it")
         for f in findings:
             print("    line %d %s -> line %d Append %s"
                   % (f.clear_line, f.clear_call, f.append_line,
@@ -1865,9 +2184,17 @@ def _run_scan(root):
     files, sites, blind_files, blind_sites = scan_summary(results)
     print("")
     print("%d file(s), %d truncate-then-append site(s)" % (files, sites))
-    print("%d file(s) and %d site(s) count no rows anywhere, so nothing in "
-          "them could refuse the truncate" % (blind_files, blind_sites))
-    return 1 if blind_files else 0
+    print("%d file(s) and %d site(s) have no row count that reaches a branch, "
+          "so nothing in them could refuse the truncate"
+          % (blind_files, blind_sites))
+    for path in unreadable:
+        print("UNREADABLE %s" % path)
+    if unreadable:
+        print("%d path(s) could not be read, so this scan is NOT complete."
+              % len(unreadable))
+    if blind_files:
+        return 1
+    return 3 if unreadable else 0
 
 
 def _gather(source, target, args, arcpy):
@@ -1888,10 +2215,33 @@ def _gather(source, target, args, arcpy):
             describe_fields(target, arcpy), describe_fields(source, arcpy),
             mapping, args.cover_allow.split(","),
             strict=APPEND_SCHEMA_TYPE == "TEST" and not args.field_mapping)
+        cover += cover_geometry(shape_type(target, arcpy),
+                                shape_type(source, arcpy))
     decision = decide(staged, live, args.min_rows, args.max_swing,
                       args.allow_empty_target, null_counts,
                       args.max_null_pct, cover)
     return staged, live, decision
+
+
+def _flag_problem(args):
+    """The usage error for the thresholds and --cover-allow, or "" when fine.
+    One place, so a single run and --plan refuse the same input."""
+    if args.min_rows < 0 or args.max_swing < 0 or args.max_null_pct < 0:
+        return ("--min-rows, --max-swing and --max-null-pct cannot be "
+                "negative.")
+    if args.cover_allow and not args.cover:
+        return "--cover-allow needs --cover."
+    return ""
+
+
+def _missing_path(paths, arcpy):
+    """The first (label, path) that does not exist, or None. A path arcpy
+    cannot even test (a dead connection file) raises, which the callers report
+    as a check that could not run."""
+    for label, one in paths:
+        if not arcpy.Exists(one):
+            return label, one
+    return None
 
 
 def _run_plan(path, args):
@@ -1917,18 +2267,24 @@ def _run_plan(path, args):
     arcpy = _import_arcpy()
     decisions = []
     for source, target in pairs:
-        for label, one in (("source", source), ("target", target)):
-            if not arcpy.Exists(one):
-                print("error: %s does not exist: %s" % (label, one),
-                      file=sys.stderr)
-                return 64
+        try:
+            missing = _missing_path((("source", source), ("target", target)),
+                                    arcpy)
+        except Exception as exc:
+            print("COULD NOT CHECK: could not read %s -> %s: %s"
+                  % (source, target, exc))
+            print("Nothing was deleted.")
+            return 3
+        if missing:
+            print("error: %s does not exist: %s" % missing, file=sys.stderr)
+            return 64
         try:
             _staged, _live, decision = _gather(source, target, args, arcpy)
         except Exception as exc:
-            print("REFUSED: could not read %s -> %s: %s"
+            print("COULD NOT CHECK: could not read %s -> %s: %s"
                   % (source, target, exc))
             print("Nothing was deleted.")
-            return 1
+            return 3
         decisions.append((source, target, decision))
         print("%s -> %s" % (source, target))
         for line in describe(decision):
@@ -1964,6 +2320,11 @@ def main(argv=None):
     if args.scan:
         return _run_scan(args.scan)
 
+    problem = _flag_problem(args)
+    if problem:
+        print("error: %s" % problem, file=sys.stderr)
+        return 64
+
     if args.plan:
         return _run_plan(args.plan, args)
 
@@ -1971,27 +2332,32 @@ def main(argv=None):
         print("error: --source and --target are both required. Use --self-test "
               "to verify the tool without a geodatabase.", file=sys.stderr)
         return 64
-    if args.min_rows < 0 or args.max_swing < 0 or args.max_null_pct < 0:
-        print("error: --min-rows, --max-swing and --max-null-pct cannot be "
-              "negative.", file=sys.stderr)
-        return 64
-    if args.cover_allow and not args.cover:
-        print("error: --cover-allow needs --cover.", file=sys.stderr)
+    if _same_table(args.source, args.target):
+        print("error: --source and --target name the same table: %s. The "
+              "truncate would empty it before the append reads it."
+              % args.target, file=sys.stderr)
         return 64
 
     arcpy = _import_arcpy()
 
-    for label, path in (("source", args.source), ("target", args.target)):
-        if not arcpy.Exists(path):
-            print("error: %s does not exist: %s" % (label, path), file=sys.stderr)
-            return 64
+    try:
+        missing = _missing_path((("source", args.source),
+                                 ("target", args.target)), arcpy)
+    except Exception as exc:
+        print("COULD NOT CHECK: could not test that the paths exist: %s" % exc)
+        print("\nNothing was deleted.")
+        return 3
+    if missing:
+        print("error: %s does not exist: %s" % missing, file=sys.stderr)
+        return 64
 
     try:
         staged, live, decision = _gather(args.source, args.target, args, arcpy)
     except Exception as exc:
-        print("REFUSED: could not read the staged and target data: %s" % exc)
+        print("COULD NOT CHECK: could not read the staged and target data: %s"
+              % exc)
         print("\nNothing was deleted.")
-        return 1
+        return 3
     print("staged source: %d row(s)" % staged)
     print("live target:   %d row(s)" % live)
     print("")
@@ -2020,4 +2386,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":  # pragma: no cover
+    # A path outside the console code page must print, not end the run.
+    for _stream in (sys.stdout, sys.stderr):
+        _stream.reconfigure(errors="backslashreplace")
     sys.exit(main())
